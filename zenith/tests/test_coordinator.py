@@ -107,7 +107,7 @@ def _seed_project(
 
 class TestHappyPath:
     def test_full_pipeline_to_done(
-        self, config: HarnessConfig, workspace: Path
+        self, config: HarnessConfig, workspace: Path, write_acceptance
     ) -> None:
         def responder(req: DispatchRequest) -> NodeHandoff:
             if req.task.type == "work":
@@ -139,6 +139,7 @@ class TestHappyPath:
 
         env = controller.advance_project(pid)
         assert env.state.state == "mission_running"
+        write_acceptance(controller.store, pid)
         env = controller.end_mission(pid)
         assert env.state.state == "done"
 
@@ -451,7 +452,7 @@ class TestDecideAttentionValidation:
 
 class TestTerminalReview:
     def test_clean_review_to_done(
-        self, config: HarnessConfig, workspace: Path
+        self, config: HarnessConfig, workspace: Path, write_acceptance
     ) -> None:
         responses: list[NodeHandoff] = [
             WorkHandoff(node_id="w1", done=True, report=""),
@@ -482,6 +483,7 @@ class TestTerminalReview:
         )
         env = controller.advance_project(pid)
         assert env.state.state == "mission_running"
+        write_acceptance(controller.store, pid)
         env = controller.end_mission(pid)
         assert env.state.state == "done"
 

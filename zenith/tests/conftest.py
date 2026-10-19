@@ -1,9 +1,25 @@
 """Shared test fixtures for v5."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture
+def write_acceptance():
+    """Write a minimal passing closure.json for a mission."""
+
+    def _write(store, project_id: str, mission_id: str = "mission-001") -> None:
+        path = store.mission_dir(project_id, mission_id) / "closure.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"commands": [{"argv": ["/bin/true"]}]}),
+            encoding="utf-8",
+        )
+
+    return _write
 
 
 @pytest.fixture

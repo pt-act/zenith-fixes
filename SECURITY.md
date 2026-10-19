@@ -75,11 +75,12 @@ decision can be retried instead of failing permanently on `task_id_collision`.
 The terminal reviewer can veto a close but cannot grant one by itself. Runtime
 also checks that the state is `mission_running`, no attention is open, every
 task/gate is cleared or superseded, every contract assertion passed, and the
-reviewer's cited evidence was actually read through the ACP fs channel. If the
-mission directory contains `closure.json`, its commands run without a shell,
-with a credential-free environment and a timeout; any non-zero exit blocks
-closure. A prompt-injected reviewer that says `done=true` therefore cannot
-seal a mission whose machine checks fail.
+reviewer's cited evidence was actually read through the ACP channel. Mission
+closure also requires `closure.json` with at least one acceptance command; a
+missing or empty file blocks closure. Its commands run without a shell, with a
+credential-free environment and a timeout; any non-zero exit blocks closure. A
+prompt-injected reviewer that says `done=true` therefore cannot seal a mission
+whose machine checks fail.
 
 ### OS-level sandbox (opt-in)
 

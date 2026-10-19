@@ -235,6 +235,27 @@ MUTATIONS = [
         """    return value""",
         "tests/test_audit_round2.py::test_agent_report_is_truncated",
     ),
+    Mutation(
+        "closure accepts missing acceptance result",
+        "src/zenith_harness/closure.py",
+        """    if acceptance is None:
+        blockers.append(
+            "no closure.json acceptance commands defined; closure is not allowed "
+            "without a machine-checkable acceptance result"
+        )
+    elif not acceptance.passed:""",
+        """    if False:
+        pass
+    elif not acceptance.passed:""",
+        "tests/test_closure.py::test_missing_acceptance_result_blocks_closure",
+    ),
+    Mutation(
+        "closure allows an empty acceptance command list",
+        "src/zenith_harness/closure.py",
+        """    commands: list[ClosureCommand] = Field(min_length=1)""",
+        """    commands: list[ClosureCommand] = Field(default_factory=list)""",
+        "tests/test_closure.py::test_closure_spec_requires_at_least_one_command",
+    ),
 ]
 
 

@@ -15,6 +15,7 @@ from typing import Literal
 
 from . import attention as attn_factory
 from .closure import (
+    AcceptanceResult,
     ClosureDecision,
     evaluate_closure,
     load_closure_spec,
@@ -43,7 +44,7 @@ from .models import (
     ValidateHandoff,
     WorkHandoff,
 )
-from .storage import ProjectStore, utc_now_filesafe
+from .storage import CorruptArtifact, ProjectStore, utc_now_filesafe
 from .envelope import public_attention_items
 
 logger = logging.getLogger(__name__)
@@ -760,10 +761,31 @@ class MissionCoordinator:
     ) -> ClosureDecision:
         """Machine checks + reviewer verdict, fail-closed."""
         workspace = Path(self.store.workspace_dir(self.project_id))
-        spec = load_closure_spec(self.store, self.project_id, mid)
-        acceptance = None
-        if spec is not None and report.done:
+        spec_error: str | None = None
+        try:
+            spec = load_closure_spec(self.store, self.project_id, mid)
+        except CorruptArtifact as exc:
+            spec = None
+            spec_error = str(exc)
+        if spec is None:
+            acceptance = AcceptanceResult(
+                passed=False,
+                reports=[
+                    "FAIL "
+                    + (
+                        f"invalid closure.json: {spec_error}"
+                        if spec_error
+                        else "no closure.json acceptance commands defined; "
+                        "closure is not allowed without one"
+                    )
+                ],
+            )
+        elif report.done:
             acceptance = run_acceptance(spec, workspace)
+        else:
+            acceptance = AcceptanceResult(
+                passed=False, reports=["FAIL terminal reviewer reported gaps"]
+            )
         read_paths = (
             set(report.read_paths) if report.read_paths is not None else None
         )

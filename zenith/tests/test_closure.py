@@ -93,7 +93,9 @@ def _evaluate(
     review: TerminalReviewHandoff,
     *,
     read_paths: set[str] | None = None,
-    acceptance: AcceptanceResult | None = None,
+    acceptance: AcceptanceResult | None = AcceptanceResult(
+        passed=True, reports=["PASS test acceptance"]
+    ),
 ):
     return evaluate_closure(
         state=store.load_state(pid),
@@ -115,6 +117,29 @@ def test_clean_mission_with_read_evidence_is_allowed(store: ProjectStore, tmp_pa
         store, pid, mid, ws, review, read_paths={str((ws / "README.md").resolve())}
     )
     assert decision.allowed, decision.blockers
+
+
+def test_missing_acceptance_result_blocks_closure(
+    store: ProjectStore, tmp_path: Path
+) -> None:
+    pid, mid, ws = _seed(store, tmp_path)
+    review = TerminalReviewHandoff(done=True, report="clean", evidence=["README.md"])
+    decision = _evaluate(
+        store,
+        pid,
+        mid,
+        ws,
+        review,
+        read_paths={str((ws / "README.md").resolve())},
+        acceptance=None,
+    )
+    assert not decision.allowed
+    assert any("closure.json" in blocker for blocker in decision.blockers)
+
+
+def test_closure_spec_requires_at_least_one_command() -> None:
+    with pytest.raises(Exception):
+        ClosureSpec()
 
 
 def test_pending_assertion_blocks_even_when_reviewer_says_done(
@@ -201,6 +226,21 @@ def _empty_mission(store: ProjectStore, tmp_path: Path) -> tuple[str, str, Path]
     store.save_task_state(record.id, mid, TaskStateFile())
     store.save_contract_state(record.id, mid, ContractStateFile())
     return record.id, mid, ws
+
+
+def test_coordinator_missing_closure_json_blocks_done(
+    store: ProjectStore, tmp_path: Path
+) -> None:
+    pid, mid, _ = _empty_mission(store, tmp_path)
+    reviewer = MockTerminalReviewer(
+        TerminalReviewHandoff(
+            done=True, report="clean", evidence=["README.md"]
+        )
+    )
+    env = _controller(store, reviewer).end_mission(pid)
+    assert env.state.state == "attention_needed"
+    report = store.load_attention(pid)[0].report
+    assert "no closure.json acceptance commands" in report
 
 
 def test_coordinator_acceptance_failure_blocks_done(store: ProjectStore, tmp_path: Path) -> None:

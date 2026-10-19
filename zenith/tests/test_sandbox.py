@@ -83,6 +83,38 @@ def _unshare_or_skip() -> UnshareSandbox:
     return sandbox
 
 
+def test_bwrap_blocks_outside_read_and_allows_workspace_write(tmp_path: Path) -> None:
+    sandbox = BwrapSandbox()
+    if not sandbox.available():
+        pytest.skip("bwrap is not installed")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (tmp_path / "secret.txt").write_text("HOST-SECRET\n", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home)}
+    script = (
+        f"set -e; "
+        f"if cat {tmp_path}/secret.txt >/dev/null 2>&1; then echo LEAK; exit 3; fi; "
+        f"echo ok > {ws}/inside.txt; "
+        "test -r /etc/passwd; "
+        "echo done"
+    )
+    argv = sandbox.wrap(
+        ["/bin/sh", "-c", script],
+        cwd=ws,
+        env=env,
+        workspace=ws,
+        home=home,
+    )
+    result = subprocess.run(
+        argv, env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert "done" in result.stdout
+    assert (ws / "inside.txt").read_text() == "ok\n"
+
+
 def test_unshare_blocks_outside_read_and_allows_workspace_write(tmp_path: Path) -> None:
     sandbox = _unshare_or_skip()
     ws = tmp_path / "ws"
@@ -144,6 +176,12 @@ def test_sandbox_env_points_at_node_home(tmp_path: Path) -> None:
     env = sandbox_env_for_provider("codex", home, {"PATH": "/usr/bin"})
     assert env["HOME"] == str(home)
     assert env["CODEX_HOME"] == str(home / ".codex")
+
+
+def test_get_sandbox_auto_prefers_bwrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not BwrapSandbox().available():
+        pytest.skip("bwrap is not installed")
+    assert isinstance(get_sandbox("auto"), BwrapSandbox)
 
 
 def test_get_sandbox_auto_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

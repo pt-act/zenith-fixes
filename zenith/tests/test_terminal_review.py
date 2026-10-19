@@ -93,7 +93,7 @@ def _responder(req: DispatchRequest) -> NodeHandoff:
 
 class TestCleanReview:
     def test_clean_review_seals_done(
-        self, config: HarnessConfig, workspace: Path
+        self, config: HarnessConfig, workspace: Path, write_acceptance
     ) -> None:
         controller = ProjectController(
             config,
@@ -110,6 +110,7 @@ class TestCleanReview:
         )
         env = controller.advance_project(pid)
         assert env.state.state == "mission_running"
+        write_acceptance(controller.store, pid)
         env = controller.end_mission(pid)
         assert env.state.state == "done"
         # Closeout written

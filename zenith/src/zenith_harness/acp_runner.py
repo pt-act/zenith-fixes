@@ -1273,6 +1273,8 @@ def _sandbox_extra_ro_paths(command: str) -> tuple[str, ...]:
         # resolved from the uv cache. Only the Hermes adapter needs these.
         add(Path.home() / ".hermes" / "hermes-agent")
         add(Path.home() / ".hermes" / "tools")
+        add(Path.home() / ".hermes" / "installs")
+        add(Path.home() / ".hermes" / "bin")
         add(Path.home() / ".hermes" / "cache" / "uv")
     return tuple(paths)
 

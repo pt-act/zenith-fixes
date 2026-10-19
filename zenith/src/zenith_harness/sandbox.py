@@ -278,10 +278,10 @@ def prepare_node_home(provider_name: str | None, destination: Path) -> Path:
             _copy_tree_or_file(source_home / ".hermes" / name, hermes / name)
         for name in ("skills", "plugins"):
             _copy_tree_or_file(source_home / ".hermes" / name, hermes / name)
-        # The Hermes install resolves its Python runtime/deps through
-        # HERMES_HOME. Point at the host's read-only runtime trees (bound by
-        # the sandbox) rather than copying them into every node home.
-        for name in ("cache", "tools", "hermes-agent"):
+        # The Hermes install resolves its Python runtime/deps/install state
+        # through HERMES_HOME. Point at the host's read-only runtime trees
+        # (bound by the sandbox) rather than copying them per node.
+        for name in ("bin", "cache", "installs", "tools", "hermes-agent"):
             source = source_home / ".hermes" / name
             target = hermes / name
             if source.exists() and not target.exists():

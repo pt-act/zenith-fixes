@@ -5,7 +5,8 @@ veto a close, but it must not be the sole authority that grants one. This
 module evaluates machine-checkable closure criteria plus the reviewer's
 verdict; any blocker keeps the mission open.
 
-A `closure.json` in the mission directory may declare acceptance commands:
+A `closure.json` in the mission directory must declare at least one acceptance
+command:
 
     {"commands": [{"argv": ["uv", "run", "--frozen", "pytest", "-q"],
                    "timeout": 600}],
@@ -46,7 +47,7 @@ class ClosureCommand(BaseModel):
 class ClosureSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    commands: list[ClosureCommand] = Field(default_factory=list)
+    commands: list[ClosureCommand] = Field(min_length=1)
     require_clean_git: bool = False
 
 
@@ -230,7 +231,12 @@ def evaluate_closure(
                     f"reviewer cited {raw!r} but did not read it through ACP"
                 )
 
-    if acceptance is not None and not acceptance.passed:
+    if acceptance is None:
+        blockers.append(
+            "no closure.json acceptance commands defined; closure is not allowed "
+            "without a machine-checkable acceptance result"
+        )
+    elif not acceptance.passed:
         blockers.append("mission acceptance command failed")
         blockers.extend(
             report for report in acceptance.reports if report.startswith("FAIL")
