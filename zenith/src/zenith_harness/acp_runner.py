@@ -754,7 +754,12 @@ class ACPClient:
             # Agent-driven command execution cannot be confined to the
             # workspace by this client (arbitrary cwd, inherited environment,
             # shell metacharacters), so it is withheld unless the operator
-            # explicitly enabled it.
+            # explicitly enabled it. Log loudly: from the outside this looks
+            # like "the agent did nothing", and the operator needs the reason.
+            logger.warning(
+                "refused ACP terminal/create: agent command execution is disabled "
+                "(set ZENITH_ALLOW_AGENT_TERMINAL=1 to permit it)"
+            )
             raise ACPError(
                 "ACP terminal access is disabled; set ZENITH_ALLOW_AGENT_TERMINAL=1 "
                 "to permit agents to run commands"
