@@ -69,6 +69,26 @@ def _echo_text(text: str, *, err: bool = False) -> None:
     click.echo(text, err=err)
 
 
+# Human-readable labels for the runtime's snake_case state tokens. The wire
+# value stays machine-facing; the CLI is read by a person.
+_STATE_LABELS = {
+    "draft": "draft (no plan submitted)",
+    "mission_planning": "planning (write the contract, then submit_plan)",
+    "mission_running": "running",
+    "attention_needed": "attention needed (decide every open item)",
+    "done": "done",
+    "failed": "failed",
+    "aborted": "aborted",
+}
+
+
+def _state_label(state) -> str:
+    """Render a project state for a human, keeping the raw token visible."""
+    token = getattr(state, "state", None) or "draft"
+    label = _STATE_LABELS.get(token)
+    return f"{token} — {label}" if label else str(token)
+
+
 @click.group()
 def cli() -> None:
     """Zenith CLI — set up + inspect long-running coding projects."""
@@ -229,7 +249,7 @@ def show_project_cmd(project_id: str) -> None:
     click.echo(f"id:        {record.id}")
     click.echo(f"workspace: {record.workspace_dir}")
     click.echo(f"created:   {record.created_at}")
-    click.echo(f"state:     {state.state if state else 'draft'}")
+    click.echo(f"state:     {_state_label(state)}")
     mid = record.current_mission_id
     if mid:
         click.echo(f"mission:   {mid}")
@@ -291,7 +311,7 @@ def abort_project_cmd(project_id: str, reason: str) -> None:
         MockTerminalReviewer(TerminalReviewHandoff(done=True, report="")),
     )
     env = controller.abort_project(project_id, reason)
-    click.echo(f"Aborted {project_id}: state={env.state.state}")
+    click.echo(f"Aborted {project_id}: state={_state_label(env.state)}")
 
 
 # ---------------------------------------------------------------------------

@@ -802,7 +802,6 @@ def test_workspace_shims_are_relative(store: ProjectStore, tmp_path: Path) -> No
 # M-4 — no silent swallow
 # ---------------------------------------------------------------------------
 
-
 def test_run_cmd_logs_failure_instead_of_returning_blindly(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -846,3 +845,143 @@ def test_envelope_exposes_runtime_root(store: ProjectStore, tmp_path: Path) -> N
     # tasks.json really does live under runtimeRoot.
     store.save_task_list(record.id, mid, TaskList(tasks=[]))
     assert str(store.mission_runtime_dir(record.id, mid)).startswith(envelope.runtimeRoot or "")
+
+
+# ---------------------------------------------------------------------------
+# H-9 — configuration reaching a shell command line
+# ---------------------------------------------------------------------------
+
+
+def test_agent_reachable_config_is_not_shell_spliced(monkeypatch) -> None:
+    """H-9: the model id goes over JSON-RPC, and only user config reaches argv.
+
+    The reasoning-effort value *is* spliced into the codex command line, so it is
+    allowlisted both at `discover()` and at the point of use. The model id is
+    never spliced — it is sent as a `session/set_model` parameter — so an agent
+    that could influence it cannot inject a command.
+    """
+    from zenith_harness.acp_runner import _augment_acp_command, _resolve_worker_model
+    from zenith_harness.providers import PROVIDERS
+
+    # A hostile model id must not appear in the command line at all.
+    monkeypatch.setenv("ZENITH_WORKER_MODEL", "model; rm -rf / #")
+    command = _augment_acp_command("codex-acp", PROVIDERS["codex"])
+    assert "rm -rf" not in command
+    # It is returned as a value to send over the RPC instead.
+    assert _resolve_worker_model(PROVIDERS["codex"], "worker") == "model; rm -rf / #"
+
+
+def test_reasoning_effort_is_validated_at_point_of_use() -> None:
+    from zenith_harness.acp_runner import _augment_acp_command
+    from zenith_harness.providers import PROVIDERS
+
+    with pytest.raises(ValueError, match="not a valid reasoning effort"):
+        _augment_acp_command(
+            "codex-acp", PROVIDERS["codex"], 'high" -c sandbox_mode="danger'
+        )
+
+
+def test_only_user_configured_commands_reach_the_shell() -> None:
+    """The ACP command is assembled from operator config, never from a task.
+
+    `_augment_acp_command` is the only function that extends the command string
+    before it is handed to a shell. Feed it a provider plus hostile values in
+    every place a task or agent could influence, and assert none of them reach
+    the command line.
+    """
+    from zenith_harness.acp_runner import _augment_acp_command
+    from zenith_harness.providers import PROVIDERS
+
+    base = "codex-acp"
+    hostile_effort_values = [
+        'high" -c sandbox_mode="danger-full-access',
+        "high; touch /tmp/pwned",
+        "high$(touch /tmp/pwned)",
+        "high`touch /tmp/pwned`",
+    ]
+    for value in hostile_effort_values:
+        with pytest.raises(ValueError, match="not a valid reasoning effort"):
+            _augment_acp_command(base, PROVIDERS["codex"], value)
+
+    # With a valid effort, only the allowlisted token is spliced in.
+    out = _augment_acp_command(base, PROVIDERS["codex"], "medium")
+    assert out == 'codex-acp -c model_reasoning_effort="medium"'
+
+    # The base command itself is the operator's, passed through untouched.
+    assert _augment_acp_command("my-custom-acp --flag", PROVIDERS["claude"]) == (
+        "my-custom-acp --flag"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M-1 — attention does not grow without bound
+# ---------------------------------------------------------------------------
+
+
+def test_attention_does_not_grow_when_undecided(store: ProjectStore, tmp_path: Path) -> None:
+    """M-1: repeatedly advancing while attention is open must not accumulate.
+
+    `step()` refuses to make progress in `attention_needed`, so an orchestrator
+    that ignores attention cannot make the queue grow.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    record = store.create_project("attention growth", workspace)
+    mid = "mission-001"
+    record.current_mission_id = mid
+    store.save_project(record)
+    store.save_state(record.id, MissionRunning(mission_id=mid))
+
+    tasks: list[Task] = []
+    for i in range(6):
+        tasks.append(Task(id=f"W{i}", type="work", body="b", targets=[f"A{i}"], skill="s"))
+        tasks.append(
+            Task(id=f"V{i}", type="validate", body="v", targets=[f"A{i}"], skill="s",
+                 depends_on=[f"W{i}"])
+        )
+        tasks.append(
+            Task(id=f"G{i}", type="gate", body="", targets=[f"A{i}"], depends_on=[f"V{i}"])
+        )
+    store.save_task_list(record.id, mid, TaskList(tasks=tasks))
+    ts = TaskStateFile()
+    for task in tasks:
+        ts.set_status(task.id, "pending")
+    store.save_task_state(record.id, mid, ts)
+    store.save_contract_state(
+        record.id, mid,
+        ContractStateFile(items={f"A{i}": ContractStateEntry() for i in range(6)}),
+    )
+
+    def respond(request):  # noqa: ANN001, ANN202
+        if request.task.type == "validate":
+            return ValidateHandoff(
+                node_id=request.task.id, done=True, report="ok", passed=True,
+                items=[ValidationItem(item_id=t, passed=True) for t in request.task.targets],
+            )
+        return WorkHandoff(node_id=request.task.id, done=True, report="ok")
+
+    controller = ProjectController(
+        store.config,
+        MockDispatcher(respond),
+        MockTerminalReviewer(TerminalReviewHandoff(done=True)),
+    )
+    peak = 0
+    for _ in range(25):
+        controller.advance_project(record.id)
+        peak = max(peak, len(store.load_attention(record.id)))
+    assert peak <= 2, f"attention grew to {peak} items while undecided"
+
+
+# ---------------------------------------------------------------------------
+# L-1 — state tokens are rendered for a human
+# ---------------------------------------------------------------------------
+
+
+def test_cli_renders_state_with_a_human_label() -> None:
+    from zenith_harness.cli import _state_label
+    from zenith_harness.models import MissionRunning
+
+    label = _state_label(MissionRunning(mission_id="mission-001"))
+    assert label.startswith("mission_running")
+    assert "running" in label
+    assert _state_label(None).startswith("draft")
