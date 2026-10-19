@@ -419,6 +419,7 @@ _WORKSPACE_LOCAL_PATHS = (
     ".claude/agents/",
     ".codex/config.toml",
     ".codex/agents/",
+    ".zenith-review-*/",
 )
 
 
