@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import tomllib
 from pathlib import Path
@@ -215,21 +216,40 @@ class TestInit:
         assert "gpt-5.6-luna" in server_env["ZENITH_WORKER_ACP_COMMAND"]
 
     def test_init_resolves_bare_acp_command_through_path(
-        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+        self,
+        runner: CliRunner,
+        workspace: Path,
+        env: dict[str, str],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A bare adapter name is resolved to an absolute path.
 
         The worker subprocess inherits the environment, but not reliably the
         orchestrator's PATH (e.g. a desktop-launched session), and a missing
         adapter used to surface only as a synthesized "missing handoff".
+
+        The adapter is staged in a private directory rather than taken from the
+        host. Whether `hermes` happens to be installed is a property of the
+        machine, not of the code under test, and relying on it made this test
+        fail on every clean CI runner.
         """
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        hermes = bindir / "hermes"
+        hermes.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        hermes.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
+        )
+
         r = runner.invoke(
             cli, ["init", "--workspace-dir", str(workspace), "--agent", "hermes"]
         )
         assert r.exit_code == 0, r.output
         mcp = json.loads((workspace / ".mcp.json").read_text())
         command = mcp["mcpServers"]["zenith"]["env"]["ZENITH_WORKER_ACP_COMMAND"]
-        assert command.startswith("/"), command
+        assert command == shlex.join([str(hermes), "acp"]), command
 
     def test_init_reasoning_effort_flags_override_env(
         self,
