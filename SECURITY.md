@@ -1,10 +1,70 @@
 # Security Policy
 
+## This repository is a hardened downstream fork
+
+`pt-act/zenith-fixes` is a maintained fork of
+[`Intelligent-Internet/zenith`](https://github.com/Intelligent-Internet/zenith).
+Upstream's last commit is `a8d9b57` (2026-09-06). This fork adds 18 commits on
+top of it: seventeen remediation commits from two audits, plus one follow-up
+that fixes test portability, documents the `closure.json` path, and pins the
+linter. It is released as **`v0.1.0-hardened`**.
+
+The fork exists because upstream was audited before being used as the base for
+another project, and six boundaries that the harness's own threat model depends
+on turned out not to be enforced. All six are fixed here, each with a regression
+test.
+
+### Delta from upstream
+
+| # | Boundary | At `a8d9b57` | In this fork | CVSS 3.1 |
+|---|---|---|---|---|
+| 1 | ACP filesystem confinement (`fs/read_text_file`, `fs/write_text_file`) | Any absolute path, `../` traversal, or symlinked parent resolves outside the workspace; writes also `mkdir -p` the parent | Resolved and required to stay inside the session workspace, re-checked after `mkdir` | 7.1 High |
+| 2 | Credentials reachable by agents | ACP child inherits the orchestrator's full environment; `zenith init` writes provider keys into `.mcp.json` in cleartext | Allowlisted base environment plus the selected provider's namespace only; no secrets persisted, generated config written `0600` and gitignored | 6.1 Medium |
+| 3 | Node verdict authenticity | Unauthenticated loopback MCP endpoint; any local process can POST a passing handoff | Per-node random bearer token, refused without it; server binds port 0 and reports through a port file | 6.2 Medium |
+| 4 | ACP permission gate | `session/request_permission` auto-approves, inventing `allow` when no option is offered | Denied by default; `ZENITH_ACP_PERMISSION_POLICY` is an explicit opt-in | 7.3 High |
+| 5 | ACP launch command | `create_subprocess_shell`, so metacharacters in configuration are interpreted | `shlex` split into `create_subprocess_exec`; re-validated at point of use | 7.0 Medium |
+| 6 | Agent command execution (`terminal/*`) | Unconfined `cwd`, full inherited environment, agent-set variables, shell-joined command, unbounded output buffer | Refused by default and advertised as unavailable; when enabled, `cwd` confined, allowlisted environment, `exec` not shell, output clamped | 7.8 High |
+
+Fixes land in `ee27e84` (1–6), `e7cb450` (6), `f504659` and `6f5d287` (5),
+`3448371` (round-2 findings), `99ccb28`/`d8f7b28` (fail-closed closure),
+`e6e13b9` (opt-in sandbox), and `660a054`/`38c6ffa` (prompt-injection eval).
+
+All six are **local-attack-surface** issues: the adversary is the agent process
+or another process on the same host, not a remote attacker. They matter because
+the harness's entire value proposition is that a long mission's result can be
+trusted.
+
 ## Reporting a vulnerability
 
 Please do **not** report security vulnerabilities through public GitHub issues.
 
-Instead, use [GitHub's private vulnerability reporting](https://github.com/Intelligent-Internet/zenith/security/advisories/new) for this repository. We will acknowledge your report within a few business days and keep you informed as we investigate and remediate.
+Use [GitHub's private vulnerability reporting](https://github.com/pt-act/zenith-fixes/security/advisories/new)
+for **this** repository. This channel is enabled and monitored.
+
+Do not use the equivalent link on `Intelligent-Internet/zenith` — private
+vulnerability reporting is disabled there, so that form does not exist. See
+disclosure status below.
+
+## Disclosure status
+
+Verified 2026-10-19:
+`GET /repos/Intelligent-Internet/zenith/private-vulnerability-reporting` returns
+`{"enabled": false}`. Upstream's `SECURITY.md` instructs reporters to use exactly
+that feature, so upstream advertises a reporting channel that does not exist,
+and there is no private route to the upstream maintainers.
+
+The six findings above are therefore documented publicly in this repository
+rather than held under embargo. **This is uncoordinated disclosure by
+circumstance, not by choice.** If upstream enables private reporting or asks for
+an embargo, we will cooperate.
+
+An issue was opened upstream offering the remediation as a pull-request series.
+It is a liveness probe, not a disclosure channel, and it does not reproduce
+exploit detail.
+
+**If you are running Zenith from upstream:** the environment allowlist, workspace
+confinement, verdict authentication, and permission default described below are
+*not* present in `a8d9b57`. Either use this fork or apply the commits above.
 
 ## Scope
 
@@ -181,15 +241,35 @@ If you ran an earlier version of `zenith init` with credentials in the
 environment, **rotate those keys**: the values were written to `.mcp.json` in
 cleartext.
 
+## Breaking changes in `v0.1.0-hardened`
+
+The hardening changes six defaults. If you are upgrading from upstream, these
+will change behaviour on the first run:
+
+| Change | Restore previous behaviour |
+|---|---|
+| Mission closure requires `closure.json` with at least one acceptance command | Write `missions/<missionId>/closure.json` (this is the fix, not a toggle) |
+| ACP permission requests are denied | `ZENITH_ACP_PERMISSION_POLICY=allow_all` (or `allow_read`) |
+| ACP `terminal/*` is refused | `ZENITH_ALLOW_AGENT_TERMINAL=1` |
+| Codex keeps its own sandbox and `approval_policy` | `ZENITH_ALLOW_UNSANDBOXED=1` |
+| Host-agent skill shims are not written | `ZENITH_WORKSPACE_SHIMS=1` (plus `ZENITH_REPLACE_BOOTSTRAP_SKILLS=1` to replace a bootstrap directory) |
+| Runtime dependencies are pinned to compatible-minor ranges | Not a toggle; install with `uv sync --frozen` |
+
 ## Dependency and release policy
 
 Runtime dependencies are pinned to compatible-minor ranges (`~=`) and resolved
 through the committed `uv.lock`; the documented install path and CI both run
 `uv sync --frozen`, so a build uses the reviewed lockfile rather than resolving
 new versions. Dependency bumps are reviewed changes, not automatic updates.
-Releases are tagged from `main` after the full test suite passes; security fixes
-land on the latest tag.
+
+Releases are tagged from `main` after the full test suite passes
+(`ruff check .`, `mypy src`, `pytest`). Security fixes land on the latest tag.
 
 ## Supported versions
 
-Security fixes are applied to the latest release on `main`.
+| Version | Supported |
+|---|---|
+| `v0.1.0-hardened` and later | Yes |
+| Upstream `main` at `a8d9b57` or earlier | No — six known boundary findings, unfixed |
+
+Security fixes are applied to the latest tag on `main`.
