@@ -852,8 +852,62 @@ class ACPClient:
                     }
                 )
 
+    def _record_read_tool_calls(self, params: dict[str, Any]) -> None:
+        """Best-effort provenance for adapters that read via their own tools.
+
+        ACP `fs/read_text_file` is recorded directly. Hermes/Claude/Codex
+        adapters may instead expose a `read_file`/`Read` tool and emit a
+        `tool_call` session update; capture the workspace path from rawInput so
+        the reviewer's evidence can still be tied to an observed read.
+        """
+        update = params.get("update")
+        if not isinstance(update, dict):
+            return
+        if update.get("sessionUpdate") not in ("tool_call", "tool_call_update"):
+            return
+        title = str(update.get("title") or "").lower()
+        kind = str(update.get("kind") or "").lower()
+        read_words = ("read", "view", "cat", "open")
+        write_words = ("write", "edit", "patch", "delete", "remove", "create")
+        is_read = kind == "read" or (
+            any(word in title for word in read_words)
+            and not any(word in title for word in write_words)
+        )
+        if not is_read:
+            return
+        raw = update.get("rawInput")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        for key in ("path", "file_path", "filePath", "target_file", "file", "filename"):
+            value = raw.get(key)
+            if isinstance(value, str) and value:
+                self._record_read_path(value)
+        # Some adapters put the path in `locations`.
+        for location in update.get("locations") or []:
+            if isinstance(location, dict):
+                value = location.get("path")
+                if isinstance(value, str) and value:
+                    self._record_read_path(value)
+
+    def _record_read_path(self, raw: str) -> None:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = self._workspace_root / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        if resolved.is_relative_to(self._workspace_root):
+            self.read_paths.add(str(resolved))
+
     async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
         if method == "session/update":
+            self._record_read_tool_calls(params)
             if self._session_update_handler is not None:
                 try:
                     out = self._session_update_handler(params)
@@ -1201,6 +1255,8 @@ def _sandbox_extra_ro_paths(command: str) -> tuple[str, ...]:
     if argv:
         executable = shutil.which(argv[0]) or argv[0]
         add(Path(executable).parent)
+        # Node/npm and some shims keep their runtime one level above bin/.
+        add(Path(executable).parent.parent)
         # A wrapper command may be `python /path/to/script.py`; bind the
         # script's tree too so it exists after pivot.
         for token in argv[1:]:
@@ -1210,6 +1266,12 @@ def _sandbox_extra_ro_paths(command: str) -> tuple[str, ...]:
     add(sys.prefix)
     add(Path.home() / ".local" / "bin")
     add(Path.home() / ".local" / "share" / "uv" / "tools")
+    # This host installs Hermes as a shim into ~/.hermes/hermes-agent and a
+    # private Python runtime under ~/.hermes/tools.
+    add(Path.home() / ".hermes" / "hermes-agent")
+    add(Path.home() / ".hermes" / "tools")
+    # Hermes' Python dependencies are resolved from the uv cache on this host.
+    add(Path.home() / ".hermes" / "cache" / "uv")
     return tuple(paths)
 
 

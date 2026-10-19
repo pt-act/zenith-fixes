@@ -220,9 +220,12 @@ def evaluate_closure(
     if review.done and read_paths is not None:
         if not review.evidence:
             blockers.append("terminal reviewer done=true without evidence")
+        resolved_reads = {
+            _evidence_path(workspace, raw_path) for raw_path in read_paths
+        }
         for raw in review.evidence:
             resolved = _evidence_path(workspace, raw)
-            if resolved not in read_paths:
+            if resolved not in resolved_reads:
                 blockers.append(
                     f"reviewer cited {raw!r} but did not read it through ACP"
                 )

@@ -51,7 +51,8 @@ def test_bwrap_command_shape(tmp_path: Path) -> None:
     assert argv[0] == str(fake)
     assert "--unshare-user" in argv
     assert "--die-with-parent" in argv
-    assert "--clearenv" in argv
+    assert "--clearenv" not in argv
+    assert "--setenv" not in argv
     assert "--" in argv
     assert argv[-2:] == ["/bin/echo", "hi"]
     # workspace and home are bound read-write at their absolute paths
@@ -111,6 +112,25 @@ def test_unshare_blocks_outside_read_and_allows_workspace_write(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     assert "done" in result.stdout
     assert (ws / "inside.txt").read_text() == "ok\n"
+
+
+def test_unshare_launch_config_is_private(tmp_path: Path) -> None:
+    sandbox = _unshare_or_skip()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    sandbox.wrap(
+        ["/bin/true"],
+        cwd=ws,
+        env={"PATH": "/usr/bin", "HOME": str(home), "SECRET": "do-not-leak"},
+        workspace=ws,
+        home=home,
+    )
+    configs = list(home.parent.glob("launch-*.json"))
+    assert configs
+    assert stat.S_IMODE(home.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(configs[0].stat().st_mode) == 0o600
 
 
 def test_prepare_node_home_is_private(tmp_path: Path) -> None:

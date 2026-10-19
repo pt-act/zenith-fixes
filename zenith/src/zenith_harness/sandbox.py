@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Protocol
 
@@ -133,9 +134,10 @@ class BwrapSandbox:
             cmd += ["--ro-bind-try", path, path]
         cmd += ["--bind", str(workspace), str(workspace)]
         cmd += ["--bind", str(home), str(home)]
-        cmd += ["--chdir", str(cwd), "--clearenv"]
-        for key, value in env.items():
-            cmd += ["--setenv", key, value]
+        # Do NOT pass credentials with --setenv: argv is visible in /proc to
+        # other local users. The caller already built an allowlisted `env`
+        # and passes it to create_subprocess_exec; bwrap inherits it.
+        cmd += ["--chdir", str(cwd)]
         cmd += ["--", *argv]
         return cmd
 
@@ -197,6 +199,10 @@ class UnshareSandbox:
             raise SandboxUnavailable(f"cwd {cwd} is outside the workspace")
         launch_dir = home.parent
         launch_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            launch_dir.chmod(0o700)
+        except OSError:
+            pass
         root = launch_dir / "root"
         root.mkdir(parents=True, exist_ok=True)
         config = {
@@ -208,8 +214,12 @@ class UnshareSandbox:
             "root": str(root),
             "extra_ro_paths": list(extra_ro_paths),
         }
-        config_path = launch_dir / "launch.json"
+        config_path = launch_dir / f"launch-{uuid.uuid4().hex}.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
+        try:
+            config_path.chmod(0o600)
+        except OSError:
+            pass
         return [
             self.unshare,
             "--user",
@@ -268,6 +278,17 @@ def prepare_node_home(provider_name: str | None, destination: Path) -> Path:
             _copy_tree_or_file(source_home / ".hermes" / name, hermes / name)
         for name in ("skills", "plugins"):
             _copy_tree_or_file(source_home / ".hermes" / name, hermes / name)
+        # The Hermes install resolves its Python runtime/deps through
+        # HERMES_HOME. Point at the host's read-only runtime trees (bound by
+        # the sandbox) rather than copying them into every node home.
+        for name in ("cache", "tools", "hermes-agent"):
+            source = source_home / ".hermes" / name
+            target = hermes / name
+            if source.exists() and not target.exists():
+                try:
+                    target.symlink_to(source, target_is_directory=True)
+                except OSError:
+                    pass
     return destination
 
 

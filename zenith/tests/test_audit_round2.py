@@ -282,6 +282,38 @@ def test_start_project_is_idempotent(store: ProjectStore, tmp_path: Path) -> Non
 # ---------------------------------------------------------------------------
 
 
+def test_acp_client_records_read_tool_calls_as_evidence(
+    tmp_path: Path,
+) -> None:
+    from zenith_harness.acp_runner import ACPClient
+
+    client = object.__new__(ACPClient)
+    client._workspace_root = tmp_path.resolve()
+    client.read_paths = set()
+    client._record_read_tool_calls(
+        {
+            "update": {
+                "sessionUpdate": "tool_call",
+                "title": "Read File",
+                "kind": "read",
+                "rawInput": {"path": "README.md"},
+            }
+        }
+    )
+    client._record_read_tool_calls(
+        {
+            "update": {
+                "sessionUpdate": "tool_call",
+                "title": "Read File",
+                "kind": "read",
+                "rawInput": {"path": "/etc/passwd"},
+            }
+        }
+    )
+    assert str((tmp_path / "README.md").resolve()) in client.read_paths
+    assert "/etc/passwd" not in client.read_paths
+
+
 def test_attention_cap_keeps_actionable_items() -> None:
     failures = [
         AttentionItemInternal(
