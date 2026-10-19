@@ -114,6 +114,7 @@ async def test_end_node_validate_writes_items(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setenv("ZENITH_HANDOFF_PATH", str(handoff_path))
     monkeypatch.setenv("ZENITH_NODE_TYPE", "validate")
     monkeypatch.setenv("ZENITH_NODE_ID", "v1")
+    monkeypatch.setenv("ZENITH_NODE_TARGETS", "VAL-001")
     server = create_worker_server()
     await server.call_tool(
         "end_node",
@@ -127,6 +128,61 @@ async def test_end_node_validate_writes_items(tmp_path: Path, monkeypatch) -> No
     data = json.loads(handoff_path.read_text())
     assert data["items"][0]["item_id"] == "VAL-001"
     assert data["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_end_node_drops_verdicts_for_unassigned_targets(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A validator may only report on the assertions it was assigned.
+
+    The server previously persisted whatever `items` it was given, so a
+    validator (or anything able to reach the node's MCP port) could report a
+    passing verdict for an assertion it was never asked to verify.
+    """
+    handoff_path = tmp_path / "handoff.json"
+    monkeypatch.setenv("ZENITH_HANDOFF_PATH", str(handoff_path))
+    monkeypatch.setenv("ZENITH_NODE_TYPE", "validate")
+    monkeypatch.setenv("ZENITH_NODE_ID", "v1")
+    monkeypatch.setenv("ZENITH_NODE_TARGETS", "VAL-001")
+    server = create_worker_server()
+    await server.call_tool(
+        "end_node",
+        {
+            "done": True,
+            "report": "audited",
+            "items": [
+                {"item_id": "VAL-001", "passed": True},
+                {"item_id": "VAL-NOT-MINE", "passed": True},
+            ],
+            "passed": True,
+        },
+    )
+    data = json.loads(handoff_path.read_text())
+    assert [i["item_id"] for i in data["items"]] == ["VAL-001"]
+
+
+@pytest.mark.asyncio
+async def test_end_node_without_assigned_targets_trusts_no_verdict(
+    tmp_path: Path, monkeypatch
+) -> None:
+    handoff_path = tmp_path / "handoff.json"
+    monkeypatch.setenv("ZENITH_HANDOFF_PATH", str(handoff_path))
+    monkeypatch.setenv("ZENITH_NODE_TYPE", "validate")
+    monkeypatch.setenv("ZENITH_NODE_ID", "v1")
+    monkeypatch.delenv("ZENITH_NODE_TARGETS", raising=False)
+    server = create_worker_server()
+    await server.call_tool(
+        "end_node",
+        {
+            "done": True,
+            "report": "audited",
+            "items": [{"item_id": "VAL-001", "passed": True}],
+            "passed": True,
+        },
+    )
+    data = json.loads(handoff_path.read_text())
+    assert data["items"] == []
 
 
 @pytest.mark.asyncio

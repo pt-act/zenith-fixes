@@ -28,11 +28,15 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "fastmcp>=2.0.0",
-    "pydantic>=2.0.0",
-    "jinja2>=3.1.0",
-    "pyyaml>=6.0",
-    "click>=8.1.0",
+    # Pinned to a minor range on purpose: this harness runs untrusted agents
+    # over the MCP transport, Pydantic validation, and Jinja rendering, so a
+    # silent major-version drift in any of them is a security-relevant change.
+    # Install with `uv sync --frozen` so the committed lockfile wins.
+    "fastmcp~=3.1",
+    "pydantic~=2.11",
+    "jinja2~=3.1",
+    "pyyaml~=6.0",
+    "click~=8.1",
 ]
 
 [project.urls]

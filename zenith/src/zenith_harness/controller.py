@@ -1,6 +1,6 @@
 """ProjectController — routes the 7 orchestrator MCP tools.
 
-See `specs/task_list/PRODUCT.md`. The controller owns:
+The controller owns:
 - envelope construction
 - decide_attention validation
 - TaskListPatch application via task_list_patch.apply_patch()
@@ -30,6 +30,7 @@ from .models import (
     TaskList,
     TaskListPatch,
     TaskStateFile,
+    TaskStatus,
 )
 from .storage import ProjectStore
 from .task_list_patch import apply_patch
@@ -51,6 +52,21 @@ class ToolError(Exception):
             tail = "; ".join(str(d) for d in self.details)
             return f"{self.code}: {self.message} ({tail})"
         return f"{self.code}: {self.message}"
+
+
+@dataclass
+class _DecisionPlan:
+    """A fully-validated `decide_attention` batch, staged but not yet written.
+
+    `staged` maps mission id -> (task list, task state, contract ids) with every
+    patch already applied in memory; `status_changes` maps mission id -> task id
+    -> status for the non-patch actions. `decision_number` is reserved here so
+    the audit record cannot be renumbered by a concurrent batch.
+    """
+
+    staged: dict[str, tuple[TaskList, TaskStateFile, set[str]]]
+    status_changes: dict[str, dict[str, "TaskStatus"]]
+    decision_number: int
 
 
 class ProjectController:
@@ -175,8 +191,43 @@ class ProjectController:
                 details=validation_errs,
             )
         item_by_id = {it.id: it for it in open_items}
-        next_state = self._apply_decisions(project_id, decisions, item_by_id)
-        self.store.append_decision_record(project_id, decisions, open_items)
+
+        # An abort is terminal and dominating: it must not be undone by another
+        # decision in the same batch. Previously the loop kept the *last*
+        # non-None state, so `[abort, continue]` returned MissionRunning while
+        # still writing an "aborted" audit record — the mission kept running
+        # after the operator aborted it.
+        aborting = [d for d in decisions if d.action == "abort"]
+
+        # Apply every patch to in-memory copies first. `_apply_task_list_patch`
+        # validates against the live list, so the whole batch is validated
+        # before a single byte is written; a failure therefore leaves disk
+        # untouched and the operator can simply retry a corrected batch.
+        plan = self._plan_decisions(project_id, decisions, item_by_id)
+        self._commit_decision_plan(project_id, plan)
+
+        if aborting:
+            reason = aborting[0].justification or "aborted"
+            record = self.store.load_project(project_id)
+            mid = self._current_mission_id(record, state) or record.current_mission_id
+            if mid:
+                try:
+                    self.store.seal_mission(project_id, mid, status="aborted", body=reason)
+                except FileNotFoundError:
+                    pass
+            next_state: ProjectState = Aborted(reason=reason)
+        else:
+            next_state = self._apply_decisions(project_id, decisions, item_by_id)
+
+        # Allocate the record number and write the audit trail under the same
+        # call, using the number reserved during planning so a concurrent batch
+        # cannot claim it.
+        self.store.append_decision_record(
+            project_id,
+            decisions,
+            open_items,
+            decision_number=plan.decision_number,
+        )
         self.store.clear_attention(project_id)
         self.store.save_state(project_id, next_state)
         return self._build_envelope(project_id, dag_mode="none")
@@ -278,36 +329,26 @@ class ProjectController:
         item: AttentionItemInternal,
         decision: Decision,
     ) -> ProjectState | None:
+        """Compute the resulting state for one decision.
+
+        The *disk effects* of every decision are already applied by
+        `_commit_decision_plan`; this only decides which state the batch ends
+        in. `patch` deliberately returns MissionRunning here (the patch was
+        already staged) so the state resolution stays a pure function of the
+        decision kinds.
+        """
         mid = item.mission_id
         kind = item.kind
         action = decision.action
 
         if action == "patch":
-            assert decision.patch is not None
-            self._apply_task_list_patch(project_id, mid, decision.patch)
-            task_state = self.store.load_task_state(project_id, mid)
-            # A task superseded or cancelled by this same patch is already
-            # marked `superseded` by apply_patch — do not reset it to pending.
-            retired_ids = (
-                set(decision.patch.supersede.keys()) | set(decision.patch.cancel)
-            )
-            if kind in ("node_failed", "gate_failed") and item.node_id:
-                if item.node_id not in retired_ids:
-                    task_state.set_status(item.node_id, "pending")
-            self.store.save_task_state(project_id, mid, task_state)
             return MissionRunning(mission_id=mid)
 
         if action == "retry" and item.node_id:
-            ts = self.store.load_task_state(project_id, mid)
-            ts.set_status(item.node_id, "pending")
-            self.store.save_task_state(project_id, mid, ts)
             return MissionRunning(mission_id=mid)
 
         if action == "continue":
             if kind in ("node_failed", "gate_failed") and item.node_id:
-                ts = self.store.load_task_state(project_id, mid)
-                ts.set_status(item.node_id, "cleared")
-                self.store.save_task_state(project_id, mid, ts)
                 return MissionRunning(mission_id=mid)
             if kind == "terminal_review":
                 return None
@@ -364,6 +405,122 @@ class ProjectController:
         self.store.save_contract_state(project_id, mid, cs)
 
     # ------------------------------------------------------------------
+    # Decision planning (validate everything before writing anything)
+    # ------------------------------------------------------------------
+
+    def _plan_decisions(
+        self,
+        project_id: str,
+        decisions: list[Decision],
+        item_by_id: dict[str, AttentionItemInternal],
+    ) -> _DecisionPlan:
+        """Validate and stage every decision in memory, writing nothing.
+
+        The runtime's own contract is "one `decide_attention` call resolves the
+        whole open set". Applying the decisions one-by-one to disk made that
+        non-atomic: if a later patch failed validation the earlier ones were
+        already persisted, the attention items were left open, no audit record
+        was written, and retrying the *same* batch then failed forever on
+        `task_id_collision` because the first patch had already added its task.
+        The only recovery was aborting the project.
+
+        Planning first means a rejected batch leaves disk byte-identical, so the
+        operator can correct and retry.
+        """
+        staged: dict[str, tuple[TaskList, TaskStateFile, set[str]]] = {}
+        decision_number = self.store.next_decision_number(project_id)
+
+        for dec in decisions:
+            item = item_by_id.get(dec.item_id)
+            if item is None:
+                continue
+            mid = item.mission_id
+            if dec.action == "patch":
+                assert dec.patch is not None
+                base = staged.get(
+                    mid, self._load_patch_base(project_id, mid)
+                )
+                staged[mid] = self._stage_patch(project_id, mid, base, dec.patch)
+
+        # Compute the resulting task-state view for each mission, folding in the
+        # status changes the non-patch actions imply, so the final state
+        # decision matches what will be on disk.
+        status_changes: dict[str, dict[str, TaskStatus]] = {}
+        for dec in decisions:
+            item = item_by_id.get(dec.item_id)
+            if item is None or dec.action == "patch":
+                continue
+            mid = item.mission_id
+            node_id = item.node_id
+            if not node_id:
+                continue
+            changes = status_changes.setdefault(mid, {})
+            if dec.action == "retry":
+                changes[node_id] = "pending"
+            elif dec.action == "continue" and item.kind in ("node_failed", "gate_failed"):
+                changes[node_id] = "cleared"
+
+        return _DecisionPlan(
+            staged=staged,
+            status_changes=status_changes,
+            decision_number=decision_number,
+        )
+
+    def _load_patch_base(
+        self, project_id: str, mid: str
+    ) -> tuple[TaskList, TaskStateFile, set[str]]:
+        tl = self.store.load_task_list(project_id, mid)
+        task_state = self.store.load_task_state(project_id, mid)
+        contract_state = self.store.load_contract_state(project_id, mid)
+        return tl, task_state, set(contract_state.items.keys())
+
+    def _stage_patch(
+        self,
+        project_id: str,
+        mid: str,
+        base: tuple[TaskList, TaskStateFile, set[str]],
+        patch: TaskListPatch,
+    ) -> tuple[TaskList, TaskStateFile, set[str]]:
+        """Apply one patch on top of already-staged state (no disk writes)."""
+        tl, task_state, old_ids = base
+        all_ids_on_disk = set(self.store.list_contract_assertions(project_id, mid))
+        new_on_disk = all_ids_on_disk - old_ids
+        patched_tl, patched_state, patched_ids, errs = apply_patch(
+            tl,
+            task_state,
+            old_ids,
+            patch,
+            new_contract_ids_on_disk=new_on_disk,
+        )
+        if errs:
+            raise ToolError("invalid_patch", "patch validation failed", details=errs)
+        return patched_tl, patched_state, patched_ids
+
+    def _commit_decision_plan(self, project_id: str, plan: "_DecisionPlan") -> None:
+        """Persist a fully-validated plan. Only called once planning succeeds."""
+        for mid, changes in plan.status_changes.items():
+            if mid in plan.staged:
+                # Fold the non-patch status changes into the staged task state
+                # so both land in the same single write.
+                _tl, staged_state, contract_ids = plan.staged[mid]
+                for node_id, status in changes.items():
+                    staged_state.set_status(node_id, status)
+                plan.staged[mid] = (_tl, staged_state, contract_ids)
+            else:
+                task_state = self.store.load_task_state(project_id, mid)
+                for node_id, status in changes.items():
+                    task_state.set_status(node_id, status)
+                self.store.save_task_state(project_id, mid, task_state)
+
+        for mid, (tl, task_state, contract_ids) in plan.staged.items():
+            cs = self.store.load_contract_state(project_id, mid)
+            for aid in contract_ids:
+                cs.items.setdefault(aid, _make_pending())
+            self.store.save_task_list(project_id, mid, tl)
+            self.store.save_task_state(project_id, mid, task_state)
+            self.store.save_contract_state(project_id, mid, cs)
+
+    # ------------------------------------------------------------------
     # Envelope
     # ------------------------------------------------------------------
 
@@ -383,6 +540,7 @@ class ProjectController:
                 pass
         project_root = str(self.store.zenith_dir(project_id))
         harness_root = str(self.store.bucket_root(project_id))
+        runtime_root = str(self.store.zenith_runtime_dir(project_id))
         return make_envelope(
             project_id,
             state,
@@ -391,6 +549,8 @@ class ProjectController:
             tl,
             task_state,
             dag_mode=dag_mode,
+            runtime_root=runtime_root,
+            mission_id=mid,
         )
 
     @staticmethod

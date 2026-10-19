@@ -1,6 +1,6 @@
 """Pure functions for task-list structural validation.
 
-See `specs/task_list/PRODUCT.md` §Flow §Authoring.
+Used at `submit_plan` and again after every patch.
 
 Every function returns `list[ValidationError]`. The caller assembles errors
 into the response payload. All checks operate on pure data — no I/O —

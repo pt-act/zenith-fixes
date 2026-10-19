@@ -171,6 +171,8 @@ class TestEnvelope:
             "state",
             "projectRoot",
             "harnessRoot",
+            "runtimeRoot",
+            "missionId",
             "dag",
         }
 

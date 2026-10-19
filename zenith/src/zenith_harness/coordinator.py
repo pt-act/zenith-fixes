@@ -1,12 +1,13 @@
 """MissionCoordinator — the state-machine kernel.
 
-See `specs/task_list/PRODUCT.md` §Dispatch. One `step()` call advances
+One `step()` call advances
 the state by at most one transition. The controller's `advance_project`
 tool loops `step()` until a returnable condition.
 """
 from __future__ import annotations
 
 import concurrent.futures
+import secrets
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -152,6 +153,8 @@ class MissionCoordinator:
         task_state.set_status(task.id, "running")
         task_state.set_last_attempt(task.id, spawn_ts)
         self.store.save_task_state(self.project_id, mid, task_state)
+        # Clear any stale handoff at this exact slot before dispatch.
+        self.store.clear_attempt(self.project_id, mid, spawn_ts, task.id)
 
         request = DispatchRequest(
             project_id=self.project_id,
@@ -271,6 +274,13 @@ class MissionCoordinator:
                 _BatchAttempt(task=task, spawn_ts=spawn_ts)
             )
         self.store.save_task_state(self.project_id, mid, task_state)
+        # Clear stale handoffs at these exact slots before dispatch: a file
+        # left by a previous attempt would otherwise satisfy the dispatcher's
+        # existence poll and be returned as this attempt's result.
+        for attempt in batch_attempts:
+            self.store.clear_attempt(
+                self.project_id, mid, attempt.spawn_ts, attempt.task.id
+            )
 
         requests = [
             DispatchRequest(
@@ -350,7 +360,13 @@ class MissionCoordinator:
 
     @staticmethod
     def _batch_spawn_ts(index: int) -> str:
-        return f"{utc_now_filesafe()}-{index:04d}"
+        """Unique per task within a batch *and* across same-second retries.
+
+        `utc_now_filesafe()` has one-second resolution, so two batches in the
+        same second previously produced byte-identical spawn tokens for the same
+        task id — and therefore the same attempt path.
+        """
+        return f"{utc_now_filesafe()}-{index:04d}-{secrets.token_hex(3)}"
 
     def _apply_handoff(
         self,
@@ -502,9 +518,15 @@ class MissionCoordinator:
                 validator_verdicts[v_task_id] = {t: False for t in expected}
                 missing_items[v_task_id] = list(expected)
                 continue
-            last = attempts[-1]
+            last = self.store.resolve_attempt_record(
+                self.project_id, mid, v_task_id
+            ) or attempts[-1]
             handoff = self.store.read_attempt(
-                self.project_id, mid, last.spawn_ts, v_task_id
+                self.project_id,
+                mid,
+                last.spawn_ts,
+                v_task_id,
+                task_type=v_task.type,
             )
             attempt_paths[v_task_id] = str(
                 self.store.attempt_report_path(
@@ -519,7 +541,12 @@ class MissionCoordinator:
             verdicts: dict[str, bool] = {}
             returned_ids: set[str] = set()
             for item in handoff.items:
-                if item.item_id in gate.targets:
+                # Only verdicts for assertions this validator was *assigned*
+                # count. `expected` is the assignment (task targets ∩ gate
+                # targets); a verdict outside it is not evidence, so recording
+                # it let a validator clear gate targets it was never asked to
+                # verify.
+                if item.item_id in expected:
                     verdicts[item.item_id] = bool(item.passed)
                 returned_ids.add(item.item_id)
             missing = [t for t in expected if t not in returned_ids]
@@ -758,6 +785,15 @@ class MissionCoordinator:
     def _reconcile_pending_attempts(
         self, mid: str, tl: TaskList, task_state: TaskStateFile
     ) -> StepResult | None:
+        """Resolve tasks left `running` by a crash, before any new dispatch.
+
+        A task can be left `running` with (a) no attempt file, (b) a corrupt
+        attempt file, or (c) a readable one. Case (b) previously raised
+        `JSONDecodeError` out of `step()`, which made the project permanently
+        unusable: the task stayed `running`, so every later call failed the same
+        way. Corrupt attempts now resolve to a failed handoff and raise
+        attention like any other failure.
+        """
         attention: list[AttentionItemInternal] = []
         saw_running = False
         for task in tl.tasks:
@@ -785,9 +821,15 @@ class MissionCoordinator:
                     self._apply_handoff_collect(mid, task, handoff, spawn_ts)
                 )
                 continue
-            last = attempts[-1]
+            last = self.store.resolve_attempt_record(
+                self.project_id, mid, task.id
+            ) or attempts[-1]
             read_handoff = self.store.read_attempt(
-                self.project_id, mid, last.spawn_ts, task.id
+                self.project_id,
+                mid,
+                last.spawn_ts,
+                task.id,
+                task_type=task.type,
             )
             if read_handoff is None:
                 continue

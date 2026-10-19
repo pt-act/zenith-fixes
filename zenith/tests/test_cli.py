@@ -58,17 +58,36 @@ class TestInit:
         assert server["command"] == "uv"
         assert server["args"] == _expected_mcp_server_args()
 
-    def test_init_does_not_touch_gitignore(
+    def test_init_adds_workspace_local_paths_to_gitignore(
         self, runner: CliRunner, workspace: Path, env: dict[str, str]
     ) -> None:
+        """Zenith's own agent plumbing is gitignored, and user entries survive.
+
+        This test previously asserted that `.gitignore` was left untouched. That
+        left `.mcp.json` — which carries environment configuration — as an
+        untracked-but-visible file that a routine `git add -A` would stage.
+        """
         gitignore = workspace / ".gitignore"
         gitignore.write_text("node_modules/\n")
-        original = gitignore.read_text()
         r = runner.invoke(
             cli, ["init", "--workspace-dir", str(workspace), "--agent", "claude"]
         )
         assert r.exit_code == 0, r.output
-        assert gitignore.read_text() == original
+        content = gitignore.read_text()
+        assert "node_modules/" in content
+        assert ".mcp.json" in content
+        assert ".agents/" in content
+
+    def test_init_gitignore_is_idempotent(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        for _ in range(3):
+            r = runner.invoke(
+                cli, ["init", "--workspace-dir", str(workspace), "--agent", "claude"]
+            )
+            assert r.exit_code == 0, r.output
+        content = (workspace / ".gitignore").read_text()
+        assert content.count(".mcp.json") == 1
 
     def test_idempotent(
         self, runner: CliRunner, workspace: Path, env: dict[str, str]
@@ -177,8 +196,33 @@ class TestInit:
             (workspace / ".codex" / "config.toml").read_text(encoding="utf-8")
         )
         server_env = config["mcp_servers"]["zenith"]["env"]
-        assert server_env["ZENITH_WORKER_ACP_COMMAND"] == worker_cmd
-        assert server_env["ZENITH_VALIDATOR_ACP_COMMAND"] == validator_cmd
+        # The command is preserved apart from bare-name PATH resolution (the
+        # adapter name is rewritten to an absolute path at init time so a
+        # desktop-launched session does not depend on inherited PATH).
+        assert server_env["ZENITH_WORKER_ACP_COMMAND"].endswith(
+            worker_cmd[len("codex-acp"):]
+        )
+        assert server_env["ZENITH_VALIDATOR_ACP_COMMAND"].endswith(
+            validator_cmd[len("codex-acp"):]
+        )
+        assert '"gpt-5.6-luna"' in server_env["ZENITH_WORKER_ACP_COMMAND"]
+
+    def test_init_resolves_bare_acp_command_through_path(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        """A bare adapter name is resolved to an absolute path.
+
+        The worker subprocess inherits the environment, but not reliably the
+        orchestrator's PATH (e.g. a desktop-launched session), and a missing
+        adapter used to surface only as a synthesized "missing handoff".
+        """
+        r = runner.invoke(
+            cli, ["init", "--workspace-dir", str(workspace), "--agent", "hermes"]
+        )
+        assert r.exit_code == 0, r.output
+        mcp = json.loads((workspace / ".mcp.json").read_text())
+        command = mcp["mcpServers"]["zenith"]["env"]["ZENITH_WORKER_ACP_COMMAND"]
+        assert command.startswith("/"), command
 
     def test_init_reasoning_effort_flags_override_env(
         self,
@@ -266,27 +310,50 @@ class TestInit:
         assert "ZENITH_VALIDATION_WORKER_PROVIDER" not in mcp_env
         assert "ZENITH_VALIDATION_WORKER_ACP_COMMAND" not in mcp_env
 
-    def test_claude_init_forwards_only_allowed_model_env(
+    def test_claude_init_forwards_only_non_secret_env(
         self,
         runner: CliRunner,
         workspace: Path,
         env: dict[str, str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Provider credentials must never be written into the workspace.
+
+        This test previously asserted that `ZAI_API_KEY` was copied into
+        `.mcp.json`. That file lives in the user's own repository, so the value
+        was one `git add -A` away from being committed. Non-secret configuration
+        is still forwarded; the MCP server inherits secrets from the
+        orchestrator's environment at spawn time instead.
+        """
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic")
         monkeypatch.setenv("ANTHROPIC_MODEL", "glm-5.2[1m]")
         monkeypatch.setenv("ZAI_API_KEY", "zai-test-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
         monkeypatch.setenv("DATABASE_URL", "postgres://should-not-forward")
 
         r = runner.invoke(cli, ["init", "--workspace-dir", str(workspace), "--agent", "claude"])
         assert r.exit_code == 0, r.output
 
-        mcp = json.loads((workspace / ".mcp.json").read_text())
+        raw = (workspace / ".mcp.json").read_text()
+        mcp = json.loads(raw)
         mcp_env = mcp["mcpServers"]["zenith"]["env"]
+        # Non-secret config forwarded.
         assert mcp_env["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
         assert mcp_env["ANTHROPIC_MODEL"] == "glm-5.2[1m]"
-        assert mcp_env["ZAI_API_KEY"] == "zai-test-key"
+        # Secrets and unrelated variables are not written to disk at all.
+        assert "ZAI_API_KEY" not in mcp_env
+        assert "ANTHROPIC_API_KEY" not in mcp_env
         assert "DATABASE_URL" not in mcp_env
+        assert "zai-test-key" not in raw
+        assert "sk-ant-test" not in raw
+
+    def test_mcp_json_is_owner_only(
+        self, runner: CliRunner, workspace: Path, env: dict[str, str]
+    ) -> None:
+        r = runner.invoke(cli, ["init", "--workspace-dir", str(workspace), "--agent", "claude"])
+        assert r.exit_code == 0, r.output
+        mode = (workspace / ".mcp.json").stat().st_mode & 0o777
+        assert mode == 0o600, oct(mode)
 
     def test_claude_init_writes_terminal_reviewer_env_names(
         self, runner: CliRunner, workspace: Path, env: dict[str, str]

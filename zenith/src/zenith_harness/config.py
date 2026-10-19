@@ -1,4 +1,9 @@
-"""v5 HarnessConfig. See specs/memory_v2/PRODUCT.md for layout."""
+"""v5 HarnessConfig.
+
+Layout: `$ZENITH_HOME/projects/<pid>/.zenith` (durable record) and
+`.../.zenith-runtime` (orchestrator-only cursors). Ids that become path
+components are validated by `ids.safe_path_component`.
+"""
 from __future__ import annotations
 
 import os
@@ -11,6 +16,7 @@ from .providers import (
     default_worker_provider_name,
     get_provider,
 )
+from .ids import safe_path_component
 
 DEFAULT_MAX_PARALLEL_NODES = 4
 
@@ -21,6 +27,22 @@ DEFAULT_MAX_PARALLEL_NODES = 4
 # multi-agent mode — a lane spawning its own agent swarm inside a harness
 # that already orchestrates and validates per-lane work.
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+# How the client answers ACP `session/request_permission`.
+#
+#   "deny"       — refuse every request (default). The agent cannot take an
+#                  action that requires approval, so the harness never silently
+#                  authorizes a destructive operation on the operator's behalf.
+#   "allow_all"  — approve everything. This was the previous unconditional
+#                  behaviour and is required for fully unattended runs; it is
+#                  now an explicit operator opt-in.
+#   "allow_read" — approve only requests whose offered options are read-only
+#                  kinds, deny the rest.
+VALID_PERMISSION_POLICIES = ("deny", "allow_all", "allow_read")
+
+DEFAULT_REQUEST_TIMEOUT = 120.0
+DEFAULT_PROMPT_TIMEOUT = 3600.0
+DEFAULT_MAX_TERMINAL_OUTPUT_BYTES = 8 * 1024 * 1024
 
 
 def _bundled_dir() -> Path:
@@ -57,6 +79,65 @@ def _resolve_reasoning_effort(value: str | None, *, env_var: str) -> str | None:
     return value
 
 
+def validate_reasoning_effort(value: str | None, *, source: str) -> str | None:
+    """Validate a reasoning effort at the point of use.
+
+    `discover()` validates the env var, but the value is also spliced into a
+    shell command line by `_augment_acp_command`, so it is re-checked there:
+    a code path that constructs a config without `discover()` (tests, an
+    embedding host) must not be able to inject arbitrary text into argv.
+    """
+    if value is None:
+        return None
+    if value not in VALID_REASONING_EFFORTS:
+        raise ValueError(
+            f"{source}: {value!r} is not a valid reasoning effort; "
+            f"choose one of: {', '.join(VALID_REASONING_EFFORTS)}"
+        )
+    return value
+
+
+def _resolve_bool(value: str | None, *, default: bool) -> bool:
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_permission_policy(value: str | None) -> str:
+    if not value:
+        return "deny"
+    if value not in VALID_PERMISSION_POLICIES:
+        raise ValueError(
+            f"ZENITH_ACP_PERMISSION_POLICY={value!r} is not valid; "
+            f"choose one of: {', '.join(VALID_PERMISSION_POLICIES)}"
+        )
+    return value
+
+
+def _resolve_max_bytes(value: str | None, *, default: int, env_var: str) -> int:
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{env_var}={value!r} is not an integer") from exc
+    if parsed <= 0:
+        raise ValueError(f"{env_var}={value!r} must be positive")
+    return parsed
+
+
+def _resolve_positive_float(value: str | None, *, default: float, env_var: str) -> float:
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{env_var}={value!r} is not a number") from exc
+    if parsed <= 0:
+        raise ValueError(f"{env_var}={value!r} must be positive")
+    return parsed
+
+
 @dataclass(frozen=True)
 class HarnessConfig:
     """Static configuration loaded from env. Per-call overrides allowed via `with_*`."""
@@ -77,6 +158,19 @@ class HarnessConfig:
     worker_reasoning_effort: str | None = None
     validator_reasoning_effort: str | None = None
     terminal_reviewer_reasoning_effort: str | None = None
+    # Safety/robustness controls (see VALID_PERMISSION_POLICIES).
+    permission_policy: str = "deny"
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT
+    prompt_timeout: float = DEFAULT_PROMPT_TIMEOUT
+    max_terminal_output_bytes: int = DEFAULT_MAX_TERMINAL_OUTPUT_BYTES
+    # ACP terminal access (agent-driven command execution) is off unless the
+    # operator opts in. It cannot be safely confined to the workspace with the
+    # current client implementation, so it is not granted by default.
+    allow_agent_terminal: bool = False
+    # Sandboxed vs unrestricted agent execution. Unrestricted (no sandbox, no
+    # approval) is the historical behaviour and stays available, but it is now
+    # an explicit opt-in instead of an unmarked default.
+    allow_unsandboxed: bool = False
 
     @classmethod
     def discover(cls) -> HarnessConfig:
@@ -134,6 +228,30 @@ class HarnessConfig:
             terminal_reviewer_reasoning_effort=_resolve_reasoning_effort(
                 os.environ.get("ZENITH_TERMINAL_REVIEWER_REASONING_EFFORT"),
                 env_var="ZENITH_TERMINAL_REVIEWER_REASONING_EFFORT",
+            ),
+            permission_policy=_resolve_permission_policy(
+                os.environ.get("ZENITH_ACP_PERMISSION_POLICY")
+            ),
+            request_timeout=_resolve_positive_float(
+                os.environ.get("ZENITH_ACP_REQUEST_TIMEOUT"),
+                default=DEFAULT_REQUEST_TIMEOUT,
+                env_var="ZENITH_ACP_REQUEST_TIMEOUT",
+            ),
+            prompt_timeout=_resolve_positive_float(
+                os.environ.get("ZENITH_ACP_PROMPT_TIMEOUT"),
+                default=DEFAULT_PROMPT_TIMEOUT,
+                env_var="ZENITH_ACP_PROMPT_TIMEOUT",
+            ),
+            max_terminal_output_bytes=_resolve_max_bytes(
+                os.environ.get("ZENITH_MAX_TERMINAL_OUTPUT_BYTES"),
+                default=DEFAULT_MAX_TERMINAL_OUTPUT_BYTES,
+                env_var="ZENITH_MAX_TERMINAL_OUTPUT_BYTES",
+            ),
+            allow_agent_terminal=_resolve_bool(
+                os.environ.get("ZENITH_ALLOW_AGENT_TERMINAL"), default=False
+            ),
+            allow_unsandboxed=_resolve_bool(
+                os.environ.get("ZENITH_ALLOW_UNSANDBOXED"), default=False
             ),
         )
 
@@ -233,8 +351,13 @@ class HarnessConfig:
     # ------------------------------------------------------------------
 
     def bucket_root(self, project_id: str) -> Path:
-        """Per-project root: parent of .zenith/ and .zenith-runtime/."""
-        return self.projects_dir / project_id
+        """Per-project root: parent of .zenith/ and .zenith-runtime/.
+
+        `project_id` comes from an MCP tool argument (i.e. from an agent) and is
+        joined into a path, so it is validated here — the single choke point for
+        every bucket path in the store.
+        """
+        return self.projects_dir / safe_path_component(project_id, kind="project_id")
 
     def zenith_dir(self, project_id: str) -> Path:
         """Durable, all-roles-readable record (brief, decisions, skills, missions)."""
@@ -288,3 +411,37 @@ class HarnessConfig:
                 ),
             )
         raise ValueError(f"unknown role: {role}")
+
+    # ------------------------------------------------------------------
+    # Safety accessors
+    # ------------------------------------------------------------------
+
+    def effective_runtime_mode(self) -> str | None:
+        """The ACP runtime mode to request, honouring the sandbox opt-in.
+
+        Providers declare `acp_runtime_mode` (claude: `bypassPermissions`).
+        Requesting it is an unrestricted-execution decision, so it is withheld
+        unless the operator opted in; the adapter then applies its own default
+        permission mode instead of the harness silently disabling approvals.
+        """
+        mode = self.worker_provider.acp_runtime_mode
+        if not mode:
+            return None
+        return mode if self.allow_unsandboxed else None
+
+    def terminal_available(self) -> bool:
+        """Whether ACP `terminal/*` (agent command execution) is granted."""
+        return self.allow_agent_terminal
+
+    def clamp_terminal_output(self, requested: object) -> int:
+        """Clamp an agent-supplied `outputByteLimit` to the configured ceiling.
+
+        The value arrives from the agent and previously became an unbounded
+        in-memory buffer, so a worker could ask for gigabytes.
+        """
+        limit = self.max_terminal_output_bytes
+        if isinstance(requested, bool) or not isinstance(requested, int):
+            return min(1024 * 1024, limit)
+        if requested <= 0:
+            return min(1024 * 1024, limit)
+        return min(requested, limit)

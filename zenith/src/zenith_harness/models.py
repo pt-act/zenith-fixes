@@ -1,4 +1,4 @@
-"""v5 schemas — task-list shape (see `specs/task_list/PRODUCT.md`).
+"""v5 schemas — task-list shape.
 
 The authoring vocabulary is intentionally small:
 - `Task` + `TaskList` (orchestrator authors at `submit_plan`)
@@ -101,7 +101,7 @@ class TaskList(BaseModel):
 
 
 class TaskListPatch(BaseModel):
-    """Four ops. See `specs/task_list/PRODUCT.md` §Patching.
+    """Four ops.
 
     - `add_items`: new assertion ids (contract files must exist on disk).
     - `add`: new tasks appended to the task list.
@@ -163,7 +163,7 @@ ActionName = Literal[
 
 
 class Decision(BaseModel):
-    """4 fields. See `specs/task_list/PRODUCT.md` §Patching."""
+    """4 fields: item_id, action, patch, justification."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -201,18 +201,26 @@ AttentionKind = Literal[
 
 
 class AttentionItem(BaseModel):
-    """Public attention item: an id plus the raw report to decide from."""
+    """Public attention item: an id, its kind, and the raw report to decide from.
+
+    `kind` and `mission_id` are included because the orchestrator must choose
+    between `retry` (valid only for `node_failed`) and `patch`/`continue`. They
+    used to be stripped, which forced the model to infer the decision class from
+    free-form prose and made a misparse surface as a validation error.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str
     report: str
+    kind: AttentionKind | None = None
+    mission_id: str | None = None
 
 
 class AttentionItemInternal(AttentionItem):
-    """Runtime-only metadata for applying decisions.
+    """Runtime-only item: every runtime item has a kind and a mission.
 
-    The envelope strips these fields; orchestrators read only id + report.
+    The envelope exposes `id` + `report` + `kind`; `node_id` stays internal.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -287,6 +295,13 @@ class Envelope(BaseModel):
 
     `dag` is a text view of the task list (kept named `dag` for
     envelope-surface stability).
+
+    `projectRoot` is the durable `.zenith/` record and `runtimeRoot` the
+    orchestrator-only `.zenith-runtime/` cursor tree. The task list the `dag`
+    truncation message points at (`tasks.json`) lives under `runtimeRoot`, which
+    is *not* inside `projectRoot`; without exposing it, an agent following the
+    envelope's own instructions had to guess a path (and the terminal reviewer
+    is forbidden from reading that tree at all).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -295,6 +310,8 @@ class Envelope(BaseModel):
     state: ProjectState
     projectRoot: str
     harnessRoot: str
+    runtimeRoot: str | None = None
+    missionId: str | None = None
     dag: str | None = None
 
 

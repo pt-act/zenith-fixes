@@ -151,21 +151,48 @@ def test_synthesize_missing_handoff_records_failure(
     assert handoff_path.exists()
 
 
-def test_augment_acp_command_codex_appends_bypass_flags():
+def test_augment_acp_command_codex_does_not_disable_sandbox_by_default():
+    """Unrestricted execution is opt-in, not a default.
+
+    This test previously asserted that `sandbox_mode="danger-full-access"` and
+    `approval_policy="never"` were always appended. That silently turned off
+    codex's own sandbox and approval gate for every node; the flags are now
+    gated behind the explicit `allow_unsandboxed` opt-in.
+    """
     out = _augment_acp_command("codex-acp", PROVIDERS["codex"])
+    assert 'sandbox_mode="danger-full-access"' not in out
+    assert 'approval_policy="never"' not in out
+    # The reasoning tier is still pinned.
+    assert 'model_reasoning_effort="xhigh"' in out
+    assert out.startswith("codex-acp ")
+
+
+def test_augment_acp_command_codex_appends_bypass_flags_when_opted_in():
+    out = _augment_acp_command(
+        "codex-acp", PROVIDERS["codex"], allow_unsandboxed=True
+    )
     assert 'sandbox_mode="danger-full-access"' in out
     assert 'approval_policy="never"' in out
     assert 'model_reasoning_effort="xhigh"' in out
-    assert out.startswith("codex-acp ")
 
 
 def test_augment_acp_command_codex_reasoning_effort_override():
     out = _augment_acp_command("codex-acp", PROVIDERS["codex"], reasoning_effort="medium")
     assert 'model_reasoning_effort="medium"' in out
     assert "xhigh" not in out
-    # The bypass flags are effort-independent.
-    assert 'sandbox_mode="danger-full-access"' in out
-    assert 'approval_policy="never"' in out
+    # The bypass flags are effort-independent and still opt-in.
+    assert 'sandbox_mode="danger-full-access"' not in out
+    assert 'approval_policy="never"' not in out
+
+
+def test_augment_acp_command_rejects_unvalidated_effort():
+    """The value is spliced into a shell command line, so it is re-validated."""
+    with pytest.raises(ValueError, match="not a valid reasoning effort"):
+        _augment_acp_command("codex-acp", PROVIDERS["codex"], reasoning_effort="ultra")
+    with pytest.raises(ValueError, match="not a valid reasoning effort"):
+        _augment_acp_command(
+            "codex-acp", PROVIDERS["codex"], reasoning_effort="high; rm -rf /"
+        )
 
 
 def test_augment_acp_command_claude_untouched():
@@ -190,6 +217,13 @@ def test_codex_acp_env_preserves_node_path_when_bwrap_is_present(
     env = _acp_subprocess_env(PROVIDERS["codex"])
 
     assert str(bin_dir) in env["PATH"].split(os.pathsep)
+    # Sandbox-disable hints are withheld unless the operator opted in.
+    assert "CODEX_SANDBOX" not in env
+    assert "CODEX_DISABLE_SANDBOX" not in env
+
+
+def test_codex_acp_env_sandbox_hints_only_when_opted_in():
+    env = _acp_subprocess_env(PROVIDERS["codex"], allow_unsandboxed=True)
     assert env["CODEX_SANDBOX"] == "danger-full-access"
     assert env["CODEX_DISABLE_SANDBOX"] == "1"
 
@@ -197,9 +231,24 @@ def test_codex_acp_env_preserves_node_path_when_bwrap_is_present(
 def test_codex_acp_env_includes_codex_config_json_with_effort():
     env = _acp_subprocess_env(PROVIDERS["codex"], reasoning_effort="max")
     config = json.loads(env["CODEX_CONFIG"])
-    assert config["sandbox_mode"] == "danger-full-access"
-    assert config["approval_policy"] == "never"
     assert config["model_reasoning_effort"] == "max"
+    # Not present unless explicitly opted in.
+    assert "sandbox_mode" not in config
+    assert "approval_policy" not in config
+
+
+def test_codex_acp_env_keeps_user_sandbox_values_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A user's own sandbox/approval settings must not be overwritten."""
+    monkeypatch.setenv(
+        "CODEX_CONFIG",
+        json.dumps({"sandbox_mode": "read-only", "approval_policy": "on-failure"}),
+    )
+    env = _acp_subprocess_env(PROVIDERS["codex"])
+    config = json.loads(env["CODEX_CONFIG"])
+    assert config["sandbox_mode"] == "read-only"
+    assert config["approval_policy"] == "on-failure"
 
 
 def test_codex_acp_env_codex_config_defaults_to_xhigh():
@@ -212,22 +261,20 @@ def test_codex_acp_env_merges_user_codex_config(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("CODEX_CONFIG", json.dumps({"model": "gpt-5.6-luna"}))
-    env = _acp_subprocess_env(PROVIDERS["codex"], reasoning_effort="ultra")
+    env = _acp_subprocess_env(PROVIDERS["codex"], reasoning_effort="max")
     config = json.loads(env["CODEX_CONFIG"])
     assert config["model"] == "gpt-5.6-luna"
-    assert config["sandbox_mode"] == "danger-full-access"
-    assert config["approval_policy"] == "never"
-    assert config["model_reasoning_effort"] == "ultra"
+    assert config["model_reasoning_effort"] == "max"
 
 
-def test_codex_acp_env_overrides_user_safety_values(
+def test_codex_acp_env_overrides_user_safety_values_when_opted_in(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv(
         "CODEX_CONFIG",
         json.dumps({"sandbox_mode": "read-only", "approval_policy": "on-failure"}),
     )
-    env = _acp_subprocess_env(PROVIDERS["codex"])
+    env = _acp_subprocess_env(PROVIDERS["codex"], allow_unsandboxed=True)
     config = json.loads(env["CODEX_CONFIG"])
     assert config["sandbox_mode"] == "danger-full-access"
     assert config["approval_policy"] == "never"

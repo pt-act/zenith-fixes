@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import click
@@ -40,6 +41,32 @@ RUNTIME_ENV_FORWARD_ALLOWLIST = (
     "ZAI_API_KEY",
     "ZAI_BASE_URL",
 )
+
+# Subset of the allowlist that is safe to persist to disk. Names ending in
+# _API_KEY / _AUTH_TOKEN are secrets and are never written to the workspace;
+# see `_forwarded_runtime_env`.
+_SECRET_ENV_SUFFIXES = ("_API_KEY", "_AUTH_TOKEN", "_TOKEN", "_SECRET", "_PASSWORD")
+
+
+def _echo_text(text: str, *, err: bool = False) -> None:
+    """Print text, degrading gracefully on a non-UTF-8 terminal.
+
+    The task-list render uses `—`, `→`, and `←`. On a `LC_ALL=C` terminal or a
+    log captured in a legacy encoding those become mojibake, so fall back to
+    ASCII equivalents when the stream cannot encode them.
+    """
+    stream = sys.stderr if err else sys.stdout
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        text = (
+            text.replace("→", "->")
+            .replace("←", "<-")
+            .replace("—", "--")
+            .replace("…", "...")
+        )
+    click.echo(text, err=err)
 
 
 @click.group()
@@ -133,6 +160,7 @@ def init(
         if value
     }
     _write_bootstrap_config(workspace, selection, storage_env, effort_env)
+    _ensure_workspace_gitignore(workspace)
 
     # 2) Per-provider agents + orchestrator prompt
     for provider in selection.providers():
@@ -211,7 +239,7 @@ def show_project_cmd(project_id: str) -> None:
             rendered = render_task_list(tl, ts)
             if rendered:
                 click.echo("")
-                click.echo(rendered)
+                _echo_text(rendered)
         except FileNotFoundError:
             click.echo("  (task list not yet submitted)")
 
@@ -239,7 +267,7 @@ def inspect_tasks_cmd(project_id: str, mission_id: str | None) -> None:
     ts = store.load_task_state(project_id, mission_id)
     rendered = render_task_list(tl, ts, mode="full")
     if rendered:
-        click.echo(rendered)
+        _echo_text(rendered)
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +365,70 @@ def _storage_env(
 
 
 def _forwarded_runtime_env() -> dict[str, str]:
+    """Environment passed to the MCP server it spawns.
+
+    Only *non-secret* configuration is forwarded. The provider credentials in
+    `RUNTIME_ENV_FORWARD_ALLOWLIST` are deliberately **not** copied here: they
+    used to be written verbatim into `<workspace>/.mcp.json`, i.e. into the
+    user's own repository, where the next `git add -A` committed them. The MCP
+    server inherits the orchestrator's environment at spawn time instead, so it
+    still sees the keys it needs without them ever touching disk.
+    """
     return {
         key: value
         for key in RUNTIME_ENV_FORWARD_ALLOWLIST
-        if (value := os.environ.get(key))
+        if not key.endswith(_SECRET_ENV_SUFFIXES) and (value := os.environ.get(key))
     }
+
+
+# Paths `zenith init` creates inside the user's workspace. They are
+# workspace-local agent plumbing, not project content, and `.mcp.json` in
+# particular can carry environment configuration, so they are gitignored.
+_WORKSPACE_LOCAL_PATHS = (
+    ".mcp.json",
+    ".agents/",
+    ".claude/settings.json",
+    ".claude/agents/",
+    ".codex/config.toml",
+    ".codex/agents/",
+)
+
+
+def _restrict_permissions(path: Path) -> None:
+    """Best-effort 0600 on a config file that may carry credentials."""
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _ensure_workspace_gitignore(workspace: Path) -> None:
+    """Append Zenith's workspace-local paths to `.gitignore`.
+
+    `zenith init` writes agent configuration into the repository the user
+    pointed at. Leaving those files untracked-but-visible meant a routine
+    `git add -A` staged them — historically including live API keys.
+    """
+    gitignore = workspace / ".gitignore"
+    try:
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+    except OSError:
+        return
+    missing = [
+        entry
+        for entry in _WORKSPACE_LOCAL_PATHS
+        if entry not in {line.strip() for line in existing.splitlines()}
+    ]
+    if not missing:
+        return
+    block = "\n# Zenith workspace-local agent plumbing\n" + "\n".join(missing) + "\n"
+    try:
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        gitignore.write_text(existing + block, encoding="utf-8")
+        click.echo(f"Updated {gitignore}")
+    except OSError as exc:
+        click.echo(f"warning: could not update {gitignore}: {exc}", err=True)
 
 
 def _zenith_project_root() -> Path:
@@ -363,6 +450,25 @@ def _zenith_project_root() -> Path:
     )
 
 
+def _resolve_acp_command(command: str) -> str:
+    """Resolve an ACP adapter command to something spawnable.
+
+    A bare name is resolved through PATH so the spawned worker does not depend
+    on the orchestrator's PATH surviving into a desktop-launched session, and a
+    missing adapter produces a clear error instead of a node that silently
+    synthesizes a "missing handoff".
+    """
+    if not command:
+        return command
+    parts = command.split()
+    if not parts:
+        return command
+    executable = shutil.which(parts[0])
+    if executable is None:
+        return command
+    return " ".join([executable, *parts[1:]])
+
+
 def _mcp_server_args() -> list[str]:
     return [
         "run",
@@ -382,6 +488,14 @@ def _write_bootstrap_config(
 ) -> None:
     fmt = selection.orchestrator.config_format
     env = {**selection.env(), **storage_env, **_forwarded_runtime_env(), **cli_env}
+    # Resolve bare adapter names against PATH once, at init time.
+    for key in (
+        "ZENITH_WORKER_ACP_COMMAND",
+        "ZENITH_VALIDATOR_ACP_COMMAND",
+        "ZENITH_TERMINAL_REVIEWER_ACP_COMMAND",
+    ):
+        if key in env:
+            env[key] = _resolve_acp_command(env[key])
     server_args = _mcp_server_args()
     if fmt == "mcp_json":
         path = workspace / ".mcp.json"
@@ -395,6 +509,7 @@ def _write_bootstrap_config(
             "env": env,
         }
         path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        _restrict_permissions(path)
         click.echo(f"Wrote {path}")
     elif fmt == "codex_config":
         config_path = workspace / ".codex" / "config.toml"

@@ -1,6 +1,8 @@
 """Pure TaskListPatch application + post-patch invariant re-check.
 
-See `specs/task_list/PRODUCT.md` §Patching and §Edge Cases.
+Invariants enforced here: a patch is applied to in-memory copies and
+re-validated in full before anything is persisted (see
+`ProjectController._plan_decisions`).
 
 Implementation choice: supersede/cancel REWRITE downstream `depends_on`
 references in the task list. No runtime chain resolver needed. Audit of

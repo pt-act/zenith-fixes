@@ -1,6 +1,6 @@
 """v5 MCP server. 3 modes: orchestrator / worker / terminal-reviewer.
 
-See docs/v5/08-mcp-surface.md. Tool-surface isolation is structural:
+Tool-surface isolation is structural:
 each mode registers a disjoint tool set on its own MCP server.
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ import os
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import Field
 
 from .config import HarnessConfig
@@ -103,10 +104,10 @@ def _register_orchestrator_tools(mcp: FastMCP, controller: ProjectController) ->
     # Per-project lock around mutating controller calls. The thread hop in each
     # tool prevents event-loop blocking, but two same-project tool calls could
     # otherwise race on disk state (attention, attempts, task-state, tasks).
-    # docs/v5/07-runtime-architecture.md §9 declares concurrent same-project
-    # operations undefined behavior; this lock serializes them defensively
-    # without requiring host coordination. `inspect_project` is read-only and
-    # stays uncontended.
+    # Concurrent same-project operations are undefined behavior at the
+    # process level (two orchestrators on one $ZENITH_HOME are not
+    # coordinated). This lock serializes them defensively within one server.
+    # `inspect_project` is read-only and stays uncontended.
     project_locks: dict[str, asyncio.Lock] = {}
     locks_guard = asyncio.Lock()
 
@@ -287,6 +288,18 @@ def _register_orchestrator_tools(mcp: FastMCP, controller: ProjectController) ->
 # ---------------------------------------------------------------------------
 
 
+def _assigned_targets() -> set[str]:
+    """Contract assertion ids assigned to this node.
+
+    Supplied by the dispatcher as `ZENITH_NODE_TARGETS`. When it is absent the
+    set is empty, which means *no* verdict is trusted for this node — a
+    validation handoff may not invent coverage for targets the task was never
+    assigned.
+    """
+    raw = os.environ.get("ZENITH_NODE_TARGETS", "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
 def _register_worker_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         name="end_node",
@@ -336,12 +349,29 @@ def _register_worker_tools(mcp: FastMCP) -> None:
 
         handoff: WorkHandoff | ValidateHandoff
         if node_type == "validate":
+            # A validation verdict may only report on assertions the task was
+            # actually assigned. `targets` is authoritative; anything else is
+            # dropped rather than trusted (the gate evaluator also filters, but
+            # rejecting here keeps the artifact itself honest).
+            assigned = _assigned_targets()
+            filtered_items = [i for i in (items or []) if i.item_id in assigned]
+            dropped = [
+                i.item_id for i in (items or []) if i.item_id not in assigned
+            ]
+            if dropped:
+                logger.warning(
+                    "end_node for %s dropped verdicts for unassigned target(s): %s",
+                    node_id,
+                    ", ".join(dropped),
+                )
             handoff = ValidateHandoff(
                 node_id=node_id,
                 done=done,
                 report=report,
-                items=items or [],
-                passed=bool(passed) if passed is not None else all(i.passed for i in (items or [])),
+                items=filtered_items,
+                passed=bool(passed)
+                if passed is not None
+                else all(i.passed for i in filtered_items),
                 request_attention=request_attention,
             )
         else:
@@ -461,6 +491,22 @@ def main() -> None:
     if args.transport == "stdio":
         server.run(transport="stdio")
     else:
+        # Authenticate the HTTP transports. These bind loopback and are used
+        # for per-node worker/reviewer servers, whose `end_node` /
+        # `submit_terminal_review` tools write the verdicts the coordinator
+        # trusts. Without a token any local process could POST a forged
+        # "all assertions passed" handoff to the ephemeral port.
+        token = os.environ.get("ZENITH_MCP_AUTH_TOKEN")
+        if not token:
+            raise SystemExit(
+                "Refusing to serve HTTP transport without ZENITH_MCP_AUTH_TOKEN. "
+                "The worker/terminal-reviewer MCP servers write handoff verdicts "
+                "and must not be reachable unauthenticated."
+            )
+        server.auth = StaticTokenVerifier(
+            tokens={token: {"client_id": "zenith-node", "scopes": ["zenith"]}},
+            required_scopes=["zenith"],
+        )
         server.run(transport=args.transport, host=args.host, port=args.port)
 
 

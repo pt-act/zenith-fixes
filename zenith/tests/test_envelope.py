@@ -5,6 +5,7 @@ from __future__ import annotations
 from zenith_harness.envelope import make_envelope, render_task_list
 from zenith_harness.models import (
     Draft,
+    MissionRunning,
     Task,
     TaskList,
     TaskStateFile,
@@ -96,10 +97,30 @@ class TestRenderTaskList:
             "state",
             "projectRoot",
             "harnessRoot",
+            "runtimeRoot",
+            "missionId",
             "dag",
         }
         assert dumped["projectId"] == "proj-1"
         assert dumped["harnessRoot"] == "/home/u/.zenith/projects/proj-1"
+
+    def test_envelope_exposes_runtime_root_and_mission(self) -> None:
+        """The envelope must name the tree `tasks.json` actually lives in.
+
+        `projectRoot` is the durable `.zenith/` record; the task list the `dag`
+        truncation message points at lives under `.zenith-runtime/`, which is a
+        sibling — so the path had to be guessed.
+        """
+        env = make_envelope(
+            "proj-1",
+            MissionRunning(mission_id="mission-002"),
+            "/tmp/.zenith",
+            "/home/u/.zenith/projects/proj-1",
+            runtime_root="/home/u/.zenith/projects/proj-1/.zenith-runtime",
+            mission_id="mission-002",
+        )
+        assert env.runtimeRoot == "/home/u/.zenith/projects/proj-1/.zenith-runtime"
+        assert env.missionId == "mission-002"
 
     def test_envelope_can_omit_dag(self) -> None:
         tl, ts = _build_pipeline(2)

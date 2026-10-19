@@ -98,7 +98,8 @@ def _render_summary(
     omitted = len(failed) + len(running) + len(ready) - rendered
     if omitted > 0:
         lines.append(
-            f"  ... {omitted} more frontier tasks omitted; read tasks.json for full list"
+            f"  ... {omitted} more frontier tasks omitted; read "
+            f"<runtimeRoot>/missions/<missionId>/tasks.json for full list"
         )
 
     focus = _focus_subgraph(last_cleared, ordered, preds, succs, statuses)
@@ -131,7 +132,8 @@ def _render_frontier(
     omitted = len(failed) + len(running) + len(ready) - rendered
     if omitted > 0:
         lines.append(
-            f"  ... {omitted} more frontier tasks omitted; read tasks.json for full list"
+            f"  ... {omitted} more frontier tasks omitted; read "
+            f"<runtimeRoot>/missions/<missionId>/tasks.json for full list"
         )
     return "\n".join(lines)
 
@@ -348,12 +350,16 @@ def make_envelope(
     task_state: TaskStateFile | None = None,
     *,
     dag_mode: EnvelopeDagMode = "summary",
+    runtime_root: str | None = None,
+    mission_id: str | None = None,
 ) -> Envelope:
     return Envelope(
         projectId=project_id,
         state=state,
         projectRoot=project_root,
         harnessRoot=harness_root,
+        runtimeRoot=runtime_root,
+        missionId=mission_id,
         dag=(
             None
             if dag_mode == "none"
@@ -363,8 +369,11 @@ def make_envelope(
 
 
 def public_attention_items(items: Iterable["AttentionItemInternal"]) -> list[AttentionItem]:
-    """Strip runtime metadata; public attention is only id + raw report."""
-    return [AttentionItem(id=it.id, report=it.report) for it in items]
+    """Expose id + report + kind; drop runtime-only fields such as node_id."""
+    return [
+        AttentionItem(id=it.id, report=it.report, kind=it.kind, mission_id=it.mission_id)
+        for it in items
+    ]
 
 
 from .models import AttentionItemInternal  # noqa: E402

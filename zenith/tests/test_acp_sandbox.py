@@ -44,10 +44,16 @@ def test_codex_with_no_bwrap_on_path_unchanged(monkeypatch, tmp_path: Path) -> N
     assert env["PATH"] == str(only_other)
 
 
-def test_codex_sets_env_var_hints() -> None:
-    """Belt-and-suspenders hints: codex versions that respect either env
-    var will skip bwrap regardless of PATH state.
+def test_codex_sets_env_var_hints_when_opted_in() -> None:
+    """Sandbox-disable hints are opt-in.
+
+    They previously asserted unconditionally that codex's sandbox was disabled;
+    that is now gated behind `ZENITH_ALLOW_UNSANDBOXED`.
     """
     env = _acp_subprocess_env(PROVIDERS["codex"])
-    assert env.get("CODEX_SANDBOX") == "danger-full-access"
-    assert env.get("CODEX_DISABLE_SANDBOX") == "1"
+    assert "CODEX_SANDBOX" not in env
+    assert "CODEX_DISABLE_SANDBOX" not in env
+
+    opted_in = _acp_subprocess_env(PROVIDERS["codex"], allow_unsandboxed=True)
+    assert opted_in.get("CODEX_SANDBOX") == "danger-full-access"
+    assert opted_in.get("CODEX_DISABLE_SANDBOX") == "1"
