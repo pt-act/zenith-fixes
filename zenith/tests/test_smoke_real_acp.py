@@ -141,14 +141,23 @@ def _build_task_list() -> TaskList:
     ])
 
 
-def _write_contract(workspace: Path, mission_id: str) -> None:
-    d = workspace / ".zenith" / "missions" / mission_id / "contract"
+def _write_contract(store: ProjectStore, project_id: str, mission_id: str) -> None:
+    """Write the mission contract into the project bucket.
+
+    The bucket lives at `$ZENITH_HOME/projects/<pid>/.zenith/...`, *not* under the
+    workspace: the workspace is the user's repo and stays free of harness state.
+    This helper used to write to `<workspace>/.zenith/...`, so the runtime never
+    saw the assertion and `submit_plan` failed with `empty_contract` before any
+    ACP call was made — which meant this smoke test could never exercise the path
+    it exists to cover.
+    """
+    d = store.contract_dir(project_id, mission_id)
     d.mkdir(parents=True, exist_ok=True)
     (d / "VAL-HELLO-001.md").write_text(CONTRACT_BODY)
 
 
-def _write_worker_skill(workspace: Path) -> None:
-    d = workspace / ".zenith" / "skills" / "hello-file-worker"
+def _write_worker_skill(store: ProjectStore, project_id: str) -> None:
+    d = store.zenith_dir(project_id) / "skills" / "hello-file-worker"
     d.mkdir(parents=True, exist_ok=True)
     (d / "SKILL.md").write_text(
         """---
@@ -253,12 +262,13 @@ def test_smoke_hello_mission(
 
     # 1) start_project
     start_env = controller.start_project("smoke test brief", str(workspace))
-    pid = ProjectStore(config).list_projects()[0].id
+    store = ProjectStore(config)
+    pid = store.list_projects()[0].id
     assert start_env.state.state == "mission_planning"
 
-    # 2) contract + submit_plan
-    _write_contract(workspace, "mission-001")
-    _write_worker_skill(workspace)
+    # 2) contract + submit_plan (contract goes in the project bucket)
+    _write_contract(store, pid, "mission-001")
+    _write_worker_skill(store, pid)
     plan_env = controller.submit_plan(pid, _build_task_list())
     assert plan_env.state.state == "mission_running"
 
@@ -377,8 +387,10 @@ def _run_with_real_terminal_reviewer(
     controller = ProjectController(config, dispatcher, reviewer)
 
     controller.start_project("smoke test brief", str(workspace))
-    pid = ProjectStore(config).list_projects()[0].id
-    _write_contract(workspace, "mission-001")
+    store = ProjectStore(config)
+    pid = store.list_projects()[0].id
+    _write_contract(store, pid, "mission-001")
+    _write_worker_skill(store, pid)
     controller.submit_plan(pid, _build_task_list())
 
     deadline = time.monotonic() + _TIMEOUT_S
