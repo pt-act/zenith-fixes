@@ -47,20 +47,19 @@ disclosure status below.
 
 ## Disclosure status
 
-Verified 2026-10-19:
+GitHub's private vulnerability reporting is **disabled** on
+`Intelligent-Internet/zenith` (verified 2026-10-19:
 `GET /repos/Intelligent-Internet/zenith/private-vulnerability-reporting` returns
-`{"enabled": false}`. Upstream's `SECURITY.md` instructs reporters to use exactly
-that feature, so upstream advertises a reporting channel that does not exist,
-and there is no private route to the upstream maintainers.
+`{"enabled": false}`). Upstream's `SECURITY.md` instructs reporters to use
+exactly that feature, so the documented channel does not exist.
 
-The six findings above are therefore documented publicly in this repository
-rather than held under embargo. **This is uncoordinated disclosure by
-circumstance, not by choice.** If upstream enables private reporting or asks for
-an embargo, we will cooperate.
+There is therefore no private channel on the repository itself. We reported the
+findings directly to the maintainers by email instead, and the six issues above
+are documented publicly in this repository in the meantime. If the maintainers
+ask for an embargo, we will take this policy down to a summary and cooperate.
 
-An issue was opened upstream offering the remediation as a pull-request series.
-It is a liveness probe, not a disclosure channel, and it does not reproduce
-exploit detail.
+An upstream issue offering the remediation as a pull-request series is the
+fallback if direct contact goes unanswered. It carries no exploit detail.
 
 **If you are running Zenith from upstream:** the environment allowlist, workspace
 confinement, verdict authentication, and permission default described below are
