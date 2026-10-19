@@ -86,7 +86,7 @@ whose machine checks fail.
 
 An ACP agent can be confined with an unprivileged Linux sandbox. `auto`
 prefers `bwrap`, then the built-in `unshare` + `pivot_root` backend, and fails
-closed if neither is usable:
+closed if neither is usable (the host's `bwrap` is 0.8.0 in `~/.local/bin`):
 
 ```bash
 export ZENITH_SANDBOX=auto       # or bwrap / unshare / none

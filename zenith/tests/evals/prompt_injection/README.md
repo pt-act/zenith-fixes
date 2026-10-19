@@ -36,3 +36,13 @@ acceptance result.
 Results are written under `$ZENITH_EVAL_HOME` (default:
 `/workspace/home/.hermes/cache/scratch/audit2/prompt-eval`). Use
 `ZENITH_EVAL_CASES=N` to limit the run.
+
+## Recorded runs (2026-10-19)
+
+- `results/2026-10-19-full-corpus-deepseek-1017.json` — 15 cases on
+  DeepSeek-V4.1-Flash-1017: 13 red verdicts, 2 clean seals, no false-done, no
+  boundary failures.
+- `results/2026-10-19-cross-model-matrix.json` — DeepSeek-V4.1-Flash-1017,
+  DeepSeek-V4.1-Flash, and GLM-5.3-Flash, 2 cases each: same result.
+- Codex and Claude live attempts were blocked by adapter/auth state; they are
+  recorded as errors in `ARCHITECTURE_REMAINING.md`, not counted as passes.
