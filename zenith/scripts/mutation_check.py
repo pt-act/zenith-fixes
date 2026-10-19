@@ -159,7 +159,7 @@ MUTATIONS = [
         "H-9 ACP launch goes back through a shell",
         "src/zenith_harness/acp_runner.py",
         """    return await asyncio.create_subprocess_exec(
-        *_acp_argv(command),""",
+        *argv,""",
         """    return await asyncio.create_subprocess_shell(
         command,""",
         "tests/test_audit_gaps.py::test_acp_spawn_does_not_interpret_shell_metacharacters",
@@ -187,7 +187,7 @@ MUTATIONS = [
         for key in _acp_env_allowlist(name)
         if key in os.environ
     }
-    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")""",
+    env.setdefault("PATH", os.defpath)""",
         """    env = os.environ.copy()""",
         "tests/test_audit_round2.py::test_acp_env_does_not_inherit_unrelated_secrets",
     ),
