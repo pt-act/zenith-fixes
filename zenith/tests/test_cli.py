@@ -109,8 +109,11 @@ class TestInit:
         config_path = workspace / ".codex" / "config.toml"
         assert config_path.exists()
         config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        # M-07: init must not silently disable Codex's own sandbox.
+        # M-07: init must not silently disable Codex's own sandbox or pin a
+        # stale model/reasoning tier over the user's Codex config.
         assert "sandbox_mode" not in config
+        assert "model" not in config
+        assert "model_reasoning_effort" not in config
         server = config["mcp_servers"]["zenith"]
         assert server["command"] == "uv"
         assert server["args"] == _expected_mcp_server_args()

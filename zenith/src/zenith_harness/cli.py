@@ -566,8 +566,6 @@ def _write_bootstrap_config(
         # backslashes; interpolating either raw emits invalid TOML.
         env_lines = "\n".join(f"{k} = {json.dumps(v)}" for k, v in env.items())
         block = (
-            'model = "gpt-5.5"\n'
-            'model_reasoning_effort = "xhigh"\n'
             '[features]\n'
             'memories = true\n'
             "# BEGIN zenith\n"
