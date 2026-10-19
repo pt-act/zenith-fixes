@@ -62,13 +62,12 @@ MUTATIONS = [
     Mutation(
         "C-6 decide_attention made non-atomic again",
         "src/zenith_harness/controller.py",
-        """        plan = self._plan_decisions(project_id, decisions, item_by_id)
-        self._commit_decision_plan(project_id, plan)""",
-        """        for _d in decisions:
-            _item = item_by_id.get(_d.item_id)
-            if _d.action == "patch" and _d.patch is not None and _item is not None:
-                self._apply_task_list_patch(project_id, _item.mission_id, _d.patch)
-        plan = _DecisionPlan(staged={}, status_changes={}, decision_number=self.store.next_decision_number(project_id))""",
+        """            plan = self._plan_decisions(project_id, decisions, item_by_id)""",
+        """            for _d in decisions:
+                _item = item_by_id.get(_d.item_id)
+                if _d.action == "patch" and _d.patch is not None and _item is not None:
+                    self._apply_task_list_patch(project_id, _item.mission_id, _d.patch)
+            plan = _DecisionPlan(staged={}, status_changes={}, decision_number=self.store.next_decision_number(project_id))""",
         "tests/test_audit_regressions.py::test_decide_attention_is_atomic_on_invalid_patch",
     ),
     Mutation(
@@ -120,6 +119,7 @@ MUTATIONS = [
             # waiting forever.
             logger.warning("ACP read loop terminating: %s", exc)
         finally:
+            was_closing = self._closing
             self._closing = True""",
         """        except (BrokenPipeError, ConnectionResetError, OSError, ValueError) as exc:
             raise
@@ -178,6 +178,62 @@ MUTATIONS = [
             self._ensure_symlink_shims(ws, zenith)""",
         """        self._ensure_symlink_shims(ws, zenith)""",
         "tests/test_audit_gaps.py::test_workspace_shims_are_opt_in",
+    ),
+    Mutation(
+        "C-01 ACP agent inherits os.environ again",
+        "src/zenith_harness/acp_runner.py",
+        """    env = {
+        key: os.environ[key]
+        for key in _acp_env_allowlist(name)
+        if key in os.environ
+    }
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")""",
+        """    env = os.environ.copy()""",
+        "tests/test_audit_round2.py::test_acp_env_does_not_inherit_unrelated_secrets",
+    ),
+    Mutation(
+        "H-02 decision journal rollback removed",
+        "src/zenith_harness/controller.py",
+        """            except BaseException:
+                self.store.rollback_decision_journal(project_id)
+                raise""",
+        """            except BaseException:
+                raise""",
+        "tests/test_audit_round2.py::test_decide_attention_rolls_back_on_io_failure",
+    ),
+    Mutation(
+        "M-01 corrupt state bypasses the guard",
+        "src/zenith_harness/storage.py",
+        """        return self._load_model(
+            path, TypeAdapter(ProjectState), kind="state.json"
+        )""",
+        """        return TypeAdapter(ProjectState).validate_json(
+            path.read_text(encoding="utf-8")
+        )""",
+        "tests/test_audit_round2.py::test_corrupt_state_is_tool_error_and_abort_works",
+    ),
+    Mutation(
+        "M-10 attention cap drops actionable failures again",
+        "src/zenith_harness/attention.py",
+        """        if item.kind != "gate_checkpoint" or item.id in kept_ids""",
+        """        if item.id in kept_ids""",
+        "tests/test_audit_round2.py::test_attention_cap_keeps_actionable_items",
+    ),
+    Mutation(
+        "L-01 Windows splitter falls back to shlex(posix=False)",
+        "src/zenith_harness/acp_runner.py",
+        """    return _split_windows_command(command)""",
+        """    return shlex.split(command, posix=False)""",
+        "tests/test_audit_round2.py::test_windows_command_split_preserves_backslashes",
+    ),
+    Mutation(
+        "M-09 agent report cap removed",
+        "src/zenith_harness/models.py",
+        """    if isinstance(value, str) and len(value) > MAX_AGENT_REPORT_CHARS:
+        return value[: MAX_AGENT_REPORT_CHARS - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+    return value""",
+        """    return value""",
+        "tests/test_audit_round2.py::test_agent_report_is_truncated",
     ),
 ]
 

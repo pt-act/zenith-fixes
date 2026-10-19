@@ -9,6 +9,8 @@ import argparse
 import asyncio
 import logging
 import os
+import socket
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -125,11 +127,37 @@ def _register_orchestrator_tools(mcp: FastMCP, controller: ProjectController) ->
         workspace_dir: Annotated[
             str, Field(description="Absolute path to the user's workspace.")
         ],
+        request_id: Annotated[
+            str | None,
+            Field(
+                default=None,
+                description=(
+                    "Optional idempotency key. Retrying with the same key "
+                    "returns the existing project instead of creating another."
+                ),
+            ),
+        ] = None,
+        new_project: Annotated[
+            bool,
+            Field(
+                default=False,
+                description=(
+                    "Set true to intentionally create another project for the "
+                    "same brief/workspace (otherwise a retry is idempotent)."
+                ),
+            ),
+        ] = False,
     ) -> dict[str, Any]:
         # No per-project lock: project_id does not exist until the call returns.
         try:
             return _to_payload(
-                await asyncio.to_thread(controller.start_project, brief, workspace_dir)
+                await asyncio.to_thread(
+                    controller.start_project,
+                    brief,
+                    workspace_dir,
+                    request_id=request_id,
+                    new_project=new_project,
+                )
             )
         except ToolError as exc:
             return _to_payload(exc)
@@ -403,13 +431,48 @@ def _register_terminal_reviewer_tools(mcp: FastMCP) -> None:
             str,
             Field(description="Raw closure report for the orchestrator."),
         ] = "",
+        evidence: Annotated[
+            list[str] | None,
+            Field(
+                default=None,
+                description=(
+                    "Workspace-relative paths you actually inspected or ran. "
+                    "Required when done=true."
+                ),
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         path = os.environ.get("ZENITH_TERMINAL_REVIEW_PATH")
         if not path:
             raise RuntimeError(
                 "ZENITH_TERMINAL_REVIEW_PATH not set in terminal-reviewer env"
             )
-        review = TerminalReviewHandoff(done=done, report=report)
+        evidence = [e for e in (evidence or []) if e.strip()]
+        if done and not evidence:
+            raise ValueError(
+                "done=true requires at least one evidence path inside the "
+                "workspace (a file you inspected or ran). Re-check the product "
+                "or submit done=false with the gaps you found."
+            )
+        root = Path.cwd().resolve()
+        bad: list[str] = []
+        for raw in evidence:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                bad.append(raw)
+                continue
+            if not resolved.is_relative_to(root) or not resolved.exists():
+                bad.append(raw)
+        if bad:
+            raise ValueError(
+                "evidence path(s) are not real files inside the workspace: "
+                + ", ".join(bad)
+            )
+        review = TerminalReviewHandoff(done=done, report=report, evidence=evidence)
         atomic_write_json(path, review.model_dump(mode="json"))
         return {
             "recorded": True,
@@ -451,6 +514,15 @@ def main() -> None:
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)  # 0 → ephemeral
+    parser.add_argument(
+        "--port-file",
+        default=None,
+        help=(
+            "Write the port actually bound by this process to this file. "
+            "Used by the worker/reviewer launcher so the parent never has to "
+            "guess a free port (avoids the find-free-then-bind race)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.mode == "orchestrator":
@@ -478,10 +550,50 @@ def main() -> None:
                 "The worker/terminal-reviewer MCP servers write handoff verdicts "
                 "and must not be reachable unauthenticated."
             )
+        if args.host not in {"127.0.0.1", "localhost", "::1"}:
+            if os.environ.get("ZENITH_ALLOW_REMOTE_MCP") != "1":
+                raise SystemExit(
+                    f"Refusing to bind the MCP server to non-loopback host "
+                    f"{args.host!r} over plain HTTP. Set "
+                    "ZENITH_ALLOW_REMOTE_MCP=1 only behind a TLS-terminating "
+                    "proxy; the bearer token and mission data are otherwise "
+                    "sent in cleartext."
+                )
+            logger.warning(
+                "MCP server is bound to non-loopback host %s over plain HTTP",
+                args.host,
+            )
         server.auth = StaticTokenVerifier(
             tokens={token: {"client_id": "zenith-node", "scopes": ["zenith"]}},
             required_scopes=["zenith"],
         )
+        if args.port_file:
+            # Bind here, then hand the already-bound socket to uvicorn. The
+            # parent reads the port from the file, so there is no
+            # find-free-then-bind window in which another process can claim it.
+            family = socket.AF_INET6 if ":" in args.host else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((args.host, args.port))
+            sock.listen(128)
+            port = sock.getsockname()[1]
+            Path(args.port_file).write_text(str(port), encoding="utf-8")
+            if args.transport == "sse":
+                app = server.http_app(path="/sse", transport="sse")
+            else:
+                app = server.http_app(path="/mcp", transport="streamable-http")
+            import uvicorn
+
+            uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host=args.host,
+                    port=port,
+                    log_level="warning",
+                    lifespan="on",
+                )
+            ).run(sockets=[sock])
+            return
         server.run(transport=args.transport, host=args.host, port=args.port)
 
 

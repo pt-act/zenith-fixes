@@ -44,6 +44,32 @@ that additionally requires `ZENITH_REPLACE_BOOTSTRAP_SKILLS=1`; without it the
 two trees are merged and the directory is preserved. `zenith init` still writes
 the configuration files the operator explicitly ran it to create.
 
+### ACP agent environment is allowlisted
+
+The worker/validator/reviewer ACP process is spawned with a credential-free
+base environment (`PATH`, `HOME`, `LANG`, `TERM`, `TMPDIR`, proxy/CA settings)
+plus only the selected provider's own namespace: `OPENAI_*`/`CODEX_*` for
+codex, `ANTHROPIC_*`/`CLAUDE_*` for claude, `HERMES_*` (plus common provider
+keys) for hermes. Unrelated ambient credentials (AWS, GitHub, Slack, ...) are
+not inherited. An operator who needs one more variable can name it in
+`ZENITH_ACP_ENV_ALLOW` (comma-separated). The per-node MCP server subprocess
+gets only the base environment plus its `ZENITH_*` configuration.
+
+### Concurrent orchestrators are serialized
+
+Every mutating tool call takes an OS-level per-project lock
+(`.zenith-runtime/project.lock`, `flock`/`msvcrt`). A second orchestrator
+process on the same project waits up to 60 seconds and then receives
+`project_busy`; it cannot interleave a duplicate dispatch or a lost update.
+`inspect_project` takes the same lock, so it never returns a torn snapshot.
+
+### Decision commits are journaled
+
+`decide_attention` writes a pre-image journal before its first mutation. If a
+write fails (disk full, permission error) or the process dies mid-commit, the
+next tool call restores the snapshot and removes the journal, so the same
+decision can be retried instead of failing permanently on `task_id_collision`.
+
 ### ACP launch is exec, never a shell
 
 The adapter command is configuration, but it is not code: it is split with
@@ -82,8 +108,11 @@ export ZENITH_ACP_PERMISSION_POLICY=allow_all   # or allow_read
 By default Zenith does **not** disable the agent's own sandbox or approval gate,
 and it does not request an unrestricted ACP runtime mode (`bypassPermissions`).
 Codex keeps its sandbox and `approval_policy`; Claude Code keeps its default
-permission mode. To run fully unattended — accepting that an agent can execute
-anything the user can — set:
+permission mode. `zenith init` no longer writes `sandbox_mode` into the
+generated `.codex/config.toml` — if an earlier init left
+`sandbox_mode = "danger-full-access"` there, delete that line to restore
+Codex's own default. To run fully unattended — accepting that an agent can
+execute anything the user can — set:
 
 ```bash
 export ZENITH_ALLOW_UNSANDBOXED=1

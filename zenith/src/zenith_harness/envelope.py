@@ -6,6 +6,7 @@ no DAG, a compact frontier view, or a full active task-list view.
 """
 from __future__ import annotations
 
+import shutil
 from collections import Counter
 from typing import Iterable, Literal, Mapping
 
@@ -317,10 +318,16 @@ def _task_line(
 ) -> str:
     type_label = f"[{task.type}:{task.skill}]" if task.type != "gate" else "[gate]"
     pred_ids = [p for p in preds.get(task.id, []) if statuses.get(p) != "superseded"]
-    return (
+    line = (
         f"    {task.id}  {type_label}  {statuses[task.id]}  "
         f"→ {_summarize_ids(task.targets)}  ← {_summarize_ids(pred_ids, empty='(root)')}"
     )
+    # L-06: keep rows inside a terminal. A very long skill/target token used to
+    # wrap mid-column and destroy the alignment of every following row.
+    width = max(40, shutil.get_terminal_size((100, 24)).columns)
+    if len(line) > width:
+        return line[: width - 1].rstrip() + "…"
+    return line
 
 
 def _summarize_ids(ids: list[str], *, empty: str = "-") -> str:

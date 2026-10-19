@@ -17,10 +17,11 @@ def _new_id(prefix: str) -> str:
 
 # A long mission raises one gate_checkpoint per cleared gate and nothing aged
 # them out, so the open queue grew with mission length and every
-# decide_attention had to resolve the whole set. Keep it bounded: dedupe by id,
-# then drop the oldest checkpoints first (they are advisory records of a gate
-# that already cleared), and only then the oldest items of any kind. A burst of
-# checkpoints can never displace an actionable failure.
+# decide_attention had to resolve the whole set. Keep *checkpoints* bounded.
+# Actionable items (node_failed / node_attention / gate_failed /
+# terminal_review) are never dropped: each one still requires a decision, and
+# silently discarding a failure is exactly the false-completion class the
+# harness exists to prevent (M-1 follow-up).
 MAX_OPEN_ATTENTION_ITEMS = 64
 
 
@@ -29,7 +30,7 @@ def cap_attention_items(
     *,
     max_items: int = MAX_OPEN_ATTENTION_ITEMS,
 ) -> list[AttentionItemInternal]:
-    """Bound the attention queue, preferring to drop old checkpoints."""
+    """Bound the advisory checkpoint queue, never the actionable failures."""
     deduped: list[AttentionItemInternal] = []
     seen: set[str] = set()
     for item in items:
@@ -38,22 +39,20 @@ def cap_attention_items(
         seen.add(item.id)
         deduped.append(item)
 
-    overflow = len(deduped) - max_items
-    if overflow <= 0:
+    actionable = [item for item in deduped if item.kind != "gate_checkpoint"]
+    checkpoints = [item for item in deduped if item.kind == "gate_checkpoint"]
+    if len(actionable) + len(checkpoints) <= max_items:
         return deduped
 
-    dropped: set[int] = set()
-    for index, item in enumerate(deduped):
-        if len(dropped) >= overflow:
-            break
-        if item.kind == "gate_checkpoint":
-            dropped.add(index)
-    if len(dropped) < overflow:
-        for index in range(len(deduped)):
-            if len(dropped) >= overflow:
-                break
-            dropped.add(index)
-    return [item for index, item in enumerate(deduped) if index not in dropped]
+    keep_checkpoints = max(0, max_items - len(actionable))
+    # Keep the newest checkpoints; `created_at` is monotonic enough for ageing.
+    newest = sorted(checkpoints, key=lambda item: item.created_at, reverse=True)
+    kept_ids = {item.id for item in newest[:keep_checkpoints]}
+    return [
+        item
+        for item in deduped
+        if item.kind != "gate_checkpoint" or item.id in kept_ids
+    ]
 
 
 def _handoff_report(task: Task, handoff: WorkHandoff | ValidateHandoff) -> str:

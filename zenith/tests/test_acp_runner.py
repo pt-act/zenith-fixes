@@ -90,6 +90,11 @@ def test_run_node_with_mock_agent(
     os.environ["ZENITH_HANDOFF_PATH"] = str(handoff_path)
     os.environ["ZENITH_NODE_ID"] = task.id
     os.environ["ZENITH_NODE_TYPE"] = task.type
+    # The mock agent writes the handoff directly (no MCP server). The ACP env
+    # is allowlisted now, so opt this test-only variable in explicitly.
+    os.environ["ZENITH_ACP_ENV_ALLOW"] = (
+        "ZENITH_HANDOFF_PATH,ZENITH_NODE_ID,ZENITH_NODE_TYPE"
+    )
     try:
         loader = AssetLoader(config)
         runner = ACPNodeRunner(config=config, loader=loader)
@@ -102,7 +107,7 @@ def test_run_node_with_mock_agent(
             )
 
         async def _ready_immediately(*args, **kwargs):
-            return None
+            return 9
 
         runner._start_worker_mcp_server = _no_op_server  # type: ignore[method-assign]
         runner._wait_for_server_ready = _ready_immediately  # type: ignore[method-assign]
@@ -117,7 +122,12 @@ def test_run_node_with_mock_agent(
             )
         )
     finally:
-        for k in ("ZENITH_HANDOFF_PATH", "ZENITH_NODE_ID", "ZENITH_NODE_TYPE"):
+        for k in (
+            "ZENITH_HANDOFF_PATH",
+            "ZENITH_NODE_ID",
+            "ZENITH_NODE_TYPE",
+            "ZENITH_ACP_ENV_ALLOW",
+        ):
             os.environ.pop(k, None)
 
     assert isinstance(handoff, WorkHandoff)

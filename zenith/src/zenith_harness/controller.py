@@ -10,8 +10,11 @@ The coordinator is constructed per-invocation; it has no in-memory state.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import HarnessConfig
 from .coordinator import MissionCoordinator
@@ -33,7 +36,7 @@ from .models import (
     TaskStateFile,
     TaskStatus,
 )
-from .storage import ProjectStore
+from .storage import CorruptArtifact, ProjectBusy, ProjectStore
 from .task_list_patch import apply_patch
 from .task_validation import (
     ValidationError,
@@ -90,168 +93,279 @@ class ProjectController:
     # Tool methods
     # ------------------------------------------------------------------
 
-    def start_project(self, brief: str, workspace_dir: str) -> Envelope:
+    @contextlib.contextmanager
+    def _locked(self, project_id: str):
+        """Serialize a tool call across *processes* (H-04), then recover a
+        decision journal left by a crashed commit (H-02)."""
+        if not self.store.zenith_runtime_dir(project_id).exists():
+            raise ToolError("not_found", f"project {project_id!r} not found")
+        try:
+            with self.store.project_lock(project_id):
+                self.store.recover_decision_journal(project_id)
+                yield
+        except ProjectBusy as exc:
+            raise ToolError("project_busy", str(exc)) from exc
+
+    def start_project(
+        self,
+        brief: str,
+        workspace_dir: str,
+        *,
+        request_id: str | None = None,
+        new_project: bool = False,
+    ) -> Envelope:
         if not brief.strip():
             raise ToolError("invalid_brief", "brief is empty")
-        record = self.store.create_project(brief, workspace_dir)
-        mission_id = self.store.generate_mission_id(1)
-        record.current_mission_id = mission_id
-        self.store.save_project(record)
-        self.store.save_state(
-            record.id, MissionPlanning(mission_id=mission_id)
-        )
-        return self._build_envelope(record.id, dag_mode="none")
+        resolved = str(Path(workspace_dir).expanduser().resolve())
+        # M-06: a retry after a timeout must not create a second project. The
+        # default key is deterministic from the brief+workspace; callers that
+        # genuinely want another project pass new_project=True (or a fresh
+        # request_id).
+        key = request_id or hashlib.sha256(
+            f"{brief.strip()}\0{resolved}".encode("utf-8")
+        ).hexdigest()
+        with self.store.global_lock("start"):
+            if not new_project:
+                existing = self.store.find_project_by_request_id(key)
+                if existing is not None:
+                    with self.store.project_lock(existing.id):
+                        self.store.recover_decision_journal(existing.id)
+                        return self._build_envelope(
+                            existing.id, dag_mode="none"
+                        )
+            record = self.store.create_project(
+                brief, workspace_dir, request_id=None if new_project else key
+            )
+            mission_id = self.store.generate_mission_id(1)
+            record.current_mission_id = mission_id
+            self.store.save_project(record)
+            self.store.save_state(
+                record.id, MissionPlanning(mission_id=mission_id)
+            )
+            return self._build_envelope(record.id, dag_mode="none")
 
     def submit_plan(self, project_id: str, task_list: TaskList) -> Envelope:
-        state = self._require_state(project_id)
-        if not isinstance(state, MissionPlanning):
-            raise ToolError(
-                "wrong_state",
-                f"submit_plan requires MissionPlanning; got {state.state}",
-            )
-        mid = state.mission_id
-        contract_dir = self.store.ensure_contract_dir(project_id, mid)
-        ids, parse_errs = parse_contract_dir(contract_dir)
-        if parse_errs:
-            raise ToolError(
-                "invalid_contract_dir",
-                "contract directory invalid",
-                details=parse_errs,
-            )
-        errs = validate_task_list_submission(ids, task_list)
-        if errs:
-            raise ToolError(
-                "invalid_task_list", "task list validation failed", details=errs
-            )
+        with self._locked(project_id):
+            state = self._require_state(project_id)
+            if not isinstance(state, MissionPlanning):
+                raise ToolError(
+                    "wrong_state",
+                    f"submit_plan requires MissionPlanning; got {state.state}",
+                )
+            mid = state.mission_id
+            contract_dir = self.store.ensure_contract_dir(project_id, mid)
+            ids, parse_errs = parse_contract_dir(contract_dir)
+            if parse_errs:
+                raise ToolError(
+                    "invalid_contract_dir",
+                    "contract directory invalid",
+                    details=parse_errs,
+                )
+            errs = validate_task_list_submission(ids, task_list)
+            if errs:
+                raise ToolError(
+                    "invalid_task_list", "task list validation failed", details=errs
+                )
 
-        self.store.save_task_list(project_id, mid, task_list)
-        task_state = TaskStateFile()
-        for task in task_list.tasks:
-            task_state.set_status(task.id, "pending")
-        self.store.save_task_state(project_id, mid, task_state)
-        cs = ContractStateFile()
-        for aid in ids:
-            cs.items.setdefault(aid, _make_pending())
-        self.store.save_contract_state(project_id, mid, cs)
-        self.store.save_state(project_id, MissionRunning(mission_id=mid))
-        return self._build_envelope(project_id, dag_mode="frontier")
+            self.store.save_task_list(project_id, mid, task_list)
+            task_state = TaskStateFile()
+            for task in task_list.tasks:
+                task_state.set_status(task.id, "pending")
+            self.store.save_task_state(project_id, mid, task_state)
+            cs = ContractStateFile()
+            for aid in ids:
+                cs.items.setdefault(aid, _make_pending())
+            self.store.save_contract_state(project_id, mid, cs)
+            self.store.save_state(project_id, MissionRunning(mission_id=mid))
+            return self._build_envelope(project_id, dag_mode="frontier")
 
     def advance_project(
         self,
         project_id: str,
         max_steps: int | None = None,
     ) -> Envelope:
-        self.store.sync_workspace_skill_surfaces(project_id)
-        coordinator = MissionCoordinator(
-            self.store, project_id, self.dispatcher, self.terminal_reviewer
-        )
-        steps = 0
-        while True:
-            result = coordinator.step()
-            if result.kind in ("attention_needed", "terminal", "idle"):
-                break
-            steps += 1
-            if max_steps is not None and steps >= max_steps:
-                break
-        self.store.sync_workspace_skill_surfaces(project_id)
-        return self._build_envelope(project_id, dag_mode="frontier")
+        with self._locked(project_id):
+            try:
+                self.store.sync_workspace_skill_surfaces(project_id)
+                coordinator = MissionCoordinator(
+                    self.store, project_id, self.dispatcher, self.terminal_reviewer
+                )
+                steps = 0
+                while True:
+                    result = coordinator.step()
+                    if result.kind in ("attention_needed", "terminal", "idle"):
+                        break
+                    steps += 1
+                    if max_steps is not None and steps >= max_steps:
+                        break
+                self.store.sync_workspace_skill_surfaces(project_id)
+            except CorruptArtifact as exc:
+                raise ToolError(
+                    "corrupt_artifact",
+                    f"{exc}. The project cannot advance until the file is "
+                    "repaired or removed; abort_project still works.",
+                ) from exc
+            return self._build_envelope(project_id, dag_mode="frontier")
 
     def end_mission(self, project_id: str) -> Envelope:
-        state = self._require_state(project_id)
-        if not isinstance(state, MissionRunning):
-            raise ToolError(
-                "wrong_state",
-                f"end_mission requires MissionRunning; got {state.state}",
+        with self._locked(project_id):
+            state = self._require_state(project_id)
+            if not isinstance(state, MissionRunning):
+                raise ToolError(
+                    "wrong_state",
+                    f"end_mission requires MissionRunning; got {state.state}",
+                )
+            coordinator = MissionCoordinator(
+                self.store, project_id, self.dispatcher, self.terminal_reviewer
             )
-        coordinator = MissionCoordinator(
-            self.store, project_id, self.dispatcher, self.terminal_reviewer
-        )
-        result = coordinator.close_mission(state.mission_id)
-        if result.kind == "idle":
-            raise ToolError(
-                "mission_not_ready_to_close",
-                result.detail or "mission still has runnable task work",
-            )
-        return self._build_envelope(project_id, dag_mode="none")
+            try:
+                result = coordinator.close_mission(state.mission_id)
+            except CorruptArtifact as exc:
+                raise ToolError(
+                    "corrupt_artifact",
+                    f"{exc}. Repair or remove the corrupt mission artifact "
+                    "before requesting closure.",
+                ) from exc
+            if result.kind == "idle":
+                raise ToolError(
+                    "mission_not_ready_to_close",
+                    result.detail or "mission still has runnable task work",
+                )
+            return self._build_envelope(project_id, dag_mode="none")
 
     def decide_attention(
         self,
         project_id: str,
         decisions: list[Decision],
     ) -> Envelope:
-        state = self._require_state(project_id)
-        if not isinstance(state, AttentionNeeded):
-            raise ToolError(
-                "wrong_state",
-                f"decide_attention requires AttentionNeeded; got {state.state}",
+        with self._locked(project_id):
+            state = self._require_state(project_id)
+            if not isinstance(state, AttentionNeeded):
+                raise ToolError(
+                    "wrong_state",
+                    f"decide_attention requires AttentionNeeded; got {state.state}",
+                )
+            try:
+                open_items = self.store.load_attention(project_id)
+            except CorruptArtifact as exc:
+                raise ToolError(
+                    "corrupt_attention",
+                    f"{exc}. Repair or remove {exc.path}; abort_project still works.",
+                ) from exc
+            validation_errs = self._validate_decisions(decisions, open_items)
+            if validation_errs:
+                raise ToolError(
+                    "invalid_decisions",
+                    "decision validation failed",
+                    details=validation_errs,
+                )
+            item_by_id = {it.id: it for it in open_items}
+
+            # An abort is terminal and dominating: it must not be undone by another
+            # decision in the same batch. Previously the loop kept the *last*
+            # non-None state, so `[abort, continue]` returned MissionRunning while
+            # still writing an "aborted" audit record — the mission kept running
+            # after the operator aborted it.
+            aborting = [d for d in decisions if d.action == "abort"]
+
+            # Apply every patch to in-memory copies first. `_apply_task_list_patch`
+            # validates against the live list, so the whole batch is validated
+            # before a single byte is written; a failure therefore leaves disk
+            # untouched and the operator can simply retry a corrected batch.
+            plan = self._plan_decisions(project_id, decisions, item_by_id)
+            paths, directories = self._decision_write_paths(
+                project_id, plan, decisions, state
             )
-        open_items = self.store.load_attention(project_id)
-        validation_errs = self._validate_decisions(decisions, open_items)
-        if validation_errs:
-            raise ToolError(
-                "invalid_decisions",
-                "decision validation failed",
-                details=validation_errs,
+            # H-02: journal the pre-images before the first write. A failure or
+            # crash mid-commit is rolled back to this snapshot, so the same
+            # decision can be retried instead of hitting task_id_collision.
+            self.store.begin_decision_journal(
+                project_id, paths, directories=directories
             )
-        item_by_id = {it.id: it for it in open_items}
+            try:
+                self._commit_decision_plan(project_id, plan)
 
-        # An abort is terminal and dominating: it must not be undone by another
-        # decision in the same batch. Previously the loop kept the *last*
-        # non-None state, so `[abort, continue]` returned MissionRunning while
-        # still writing an "aborted" audit record — the mission kept running
-        # after the operator aborted it.
-        aborting = [d for d in decisions if d.action == "abort"]
+                if aborting:
+                    reason = aborting[0].justification or "aborted"
+                    record = self.store.load_project(project_id)
+                    mid = (
+                        self._current_mission_id(record, state)
+                        or record.current_mission_id
+                    )
+                    if mid:
+                        try:
+                            self.store.seal_mission(
+                                project_id, mid, status="aborted", body=reason
+                            )
+                        except FileNotFoundError:
+                            pass
+                    next_state: ProjectState = Aborted(reason=reason)
+                else:
+                    next_state = self._apply_decisions(
+                        project_id, decisions, item_by_id
+                    )
 
-        # Apply every patch to in-memory copies first. `_apply_task_list_patch`
-        # validates against the live list, so the whole batch is validated
-        # before a single byte is written; a failure therefore leaves disk
-        # untouched and the operator can simply retry a corrected batch.
-        plan = self._plan_decisions(project_id, decisions, item_by_id)
-        self._commit_decision_plan(project_id, plan)
-
-        if aborting:
-            reason = aborting[0].justification or "aborted"
-            record = self.store.load_project(project_id)
-            mid = self._current_mission_id(record, state) or record.current_mission_id
-            if mid:
-                try:
-                    self.store.seal_mission(project_id, mid, status="aborted", body=reason)
-                except FileNotFoundError:
-                    pass
-            next_state: ProjectState = Aborted(reason=reason)
-        else:
-            next_state = self._apply_decisions(project_id, decisions, item_by_id)
-
-        # Allocate the record number and write the audit trail under the same
-        # call, using the number reserved during planning so a concurrent batch
-        # cannot claim it.
-        self.store.append_decision_record(
-            project_id,
-            decisions,
-            open_items,
-            decision_number=plan.decision_number,
-        )
-        self.store.consume_attention(project_id, {d.item_id for d in decisions})
-        self.store.save_state(project_id, next_state)
-        return self._build_envelope(project_id, dag_mode="none")
+                # Allocate the record number and write the audit trail under the
+                # same call, using the number reserved during planning so a
+                # concurrent batch cannot claim it.
+                self.store.append_decision_record(
+                    project_id,
+                    decisions,
+                    open_items,
+                    decision_number=plan.decision_number,
+                )
+                self.store.consume_attention(
+                    project_id, {d.item_id for d in decisions}
+                )
+                self.store.save_state(project_id, next_state)
+            except CorruptArtifact as exc:
+                self.store.rollback_decision_journal(project_id)
+                raise ToolError(
+                    "corrupt_artifact",
+                    f"{exc}. The decision was rolled back; repair or remove "
+                    "the corrupt file and retry.",
+                ) from exc
+            except BaseException:
+                self.store.rollback_decision_journal(project_id)
+                raise
+            else:
+                self.store.finish_decision_journal(project_id)
+            return self._build_envelope(project_id, dag_mode="none")
 
     def inspect_project(self, project_id: str) -> Envelope:
-        return self._build_envelope(project_id, dag_mode="full")
+        with self._locked(project_id):
+            return self._build_envelope(project_id, dag_mode="full")
 
     def abort_project(self, project_id: str, reason: str) -> Envelope:
-        record = self.store.load_project(project_id)
-        state = self.store.load_state(project_id)
-        mid = self._current_mission_id(record, state)
-        if mid:
+        # Abort is the recovery path, so it must not depend on any artifact
+        # parsing successfully. A corrupt project.json/state.json still lets
+        # us address the bucket and write a terminal Aborted state.
+        with self._locked(project_id):
             try:
-                self.store.seal_mission(
-                    project_id, mid, status="aborted", body=reason
-                )
-            except FileNotFoundError:
-                pass
-        self.store.clear_attention(project_id)
-        self.store.save_state(project_id, Aborted(reason=reason))
-        return self._build_envelope(project_id, dag_mode="none")
+                record = self.store.load_project(project_id)
+            except CorruptArtifact:
+                record = None
+            try:
+                state = self.store.load_state(project_id)
+            except CorruptArtifact:
+                state = None
+            mid = None
+            if record is not None:
+                mid = self._current_mission_id(record, state)
+            elif state is not None and isinstance(
+                state, (MissionPlanning, MissionRunning)
+            ):
+                mid = state.mission_id
+            if mid:
+                try:
+                    self.store.seal_mission(
+                        project_id, mid, status="aborted", body=reason
+                    )
+                except FileNotFoundError:
+                    pass
+            self.store.clear_attention(project_id)
+            self.store.save_state(project_id, Aborted(reason=reason))
+            return self._build_envelope(project_id, dag_mode="none")
 
     # ------------------------------------------------------------------
     # Decision pipeline
@@ -499,6 +613,50 @@ class ProjectController:
             raise ToolError("invalid_patch", "patch validation failed", details=errs)
         return patched_tl, patched_state, patched_ids
 
+    def _decision_write_paths(
+        self,
+        project_id: str,
+        plan: "_DecisionPlan",
+        decisions: list[Decision],
+        state: ProjectState,
+    ) -> tuple[list[Path], list[Path]]:
+        """Every file a decide_attention batch may write, for the journal."""
+        runtime = self.store.zenith_runtime_dir(project_id)
+        paths: set[Path] = {
+            runtime / "attention.json",
+            runtime / "state.json",
+            runtime / "project.json",
+        }
+        for mid in plan.staged:
+            mdir = self.store.mission_runtime_dir(project_id, mid)
+            paths.update(
+                {
+                    mdir / "tasks.json",
+                    mdir / "task-state.json",
+                    mdir / "contract-state.json",
+                }
+            )
+        for mid in plan.status_changes:
+            if mid not in plan.staged:
+                paths.add(self.store.mission_runtime_dir(project_id, mid) / "task-state.json")
+
+        if any(d.action in ("abort", "next_mission") for d in decisions):
+            try:
+                record = self.store.load_project(project_id)
+            except CorruptArtifact:
+                record = None
+            closeout_mid: str | None = None
+            if record is not None:
+                closeout_mid = self._current_mission_id(record, state)
+            elif isinstance(state, (MissionPlanning, MissionRunning)):
+                closeout_mid = state.mission_id
+            if closeout_mid:
+                paths.add(
+                    self.store.mission_dir(project_id, closeout_mid) / "closeout.md"
+                )
+
+        return sorted(paths), [self.store.decisions_dir(project_id)]
+
     def _commit_decision_plan(self, project_id: str, plan: "_DecisionPlan") -> None:
         """Persist a fully-validated plan. Only called once planning succeeds."""
         for mid, changes in plan.status_changes.items():
@@ -530,8 +688,20 @@ class ProjectController:
     def _build_envelope(
         self, project_id: str, *, dag_mode: EnvelopeDagMode = "summary"
     ) -> Envelope:
-        record = self.store.load_project(project_id)
-        state = self.store.load_state(project_id) or Draft()
+        try:
+            record = self.store.load_project(project_id)
+        except CorruptArtifact:
+            # abort_project must be able to return an envelope even when the
+            # project record is damaged; paths are derivable from the id.
+            record = None
+        try:
+            state = self.store.load_state(project_id) or Draft()
+        except CorruptArtifact as exc:
+            raise ToolError(
+                "corrupt_state",
+                f"{exc}. Repair or remove {exc.path} (abort_project can still "
+                "stop the project).",
+            ) from exc
         tl: TaskList | None = None
         task_state: TaskStateFile | None = None
         mid = self._current_mission_id(record, state)
@@ -539,7 +709,9 @@ class ProjectController:
             try:
                 tl = self.store.load_task_list(project_id, mid)
                 task_state = self.store.load_task_state(project_id, mid)
-            except FileNotFoundError:
+            except (FileNotFoundError, CorruptArtifact):
+                # A damaged task list must not hide the rest of the envelope;
+                # advance/decide surface the CorruptArtifact as a ToolError.
                 pass
         project_root = str(self.store.zenith_dir(project_id))
         harness_root = str(self.store.bucket_root(project_id))
@@ -560,10 +732,18 @@ class ProjectController:
     def _current_mission_id(record, state) -> str | None:
         if isinstance(state, (MissionPlanning, MissionRunning)):
             return state.mission_id
-        return record.current_mission_id
+        if record is not None:
+            return record.current_mission_id
+        return None
 
     def _require_state(self, project_id: str) -> ProjectState:
-        state = self.store.load_state(project_id)
+        try:
+            state = self.store.load_state(project_id)
+        except CorruptArtifact as exc:
+            raise ToolError(
+                "corrupt_state",
+                f"{exc}. Repair or remove {exc.path}; abort_project still works.",
+            ) from exc
         if state is None:
             raise ToolError("not_found", f"project {project_id!r} has no state")
         return state

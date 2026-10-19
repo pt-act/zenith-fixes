@@ -15,15 +15,29 @@ See `config.HarnessConfig` for the bucket layout.
 """
 from __future__ import annotations
 
+import base64
+import contextlib
 import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Iterator
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 from .config import HarnessConfig
 from .ids import (
@@ -45,6 +59,50 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class CorruptArtifact(RuntimeError):
+    """A durable/runtime JSON artifact exists but cannot be parsed.
+
+    This is deliberately distinct from FileNotFoundError: a missing cursor is
+    a normal first-run condition, while a corrupt one must be surfaced to the
+    operator (as a ToolError) instead of escaping as a raw pydantic
+    ValidationError. `abort_project` must still work when this is raised.
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"corrupt artifact at {path}: {reason}")
+
+
+class ProjectBusy(RuntimeError):
+    """Another process holds the per-project lock past the timeout."""
+
+
+def _lock_file(fd: int, *, shared: bool, blocking: bool) -> None:
+    if fcntl is not None:
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        if not blocking:
+            mode |= fcntl.LOCK_NB
+        fcntl.flock(fd, mode)
+    elif msvcrt is not None:  # pragma: no cover - Windows
+        # msvcrt has no shared mode; every lock is exclusive.
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(  # type: ignore[attr-defined]
+            fd, msvcrt.LK_NBLCK if not blocking else msvcrt.LK_LOCK, 1  # type: ignore[attr-defined]
+        )
+    else:  # pragma: no cover - neither platform
+        raise RuntimeError("no file-locking primitive available")
+
+
+def _unlock_file(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif msvcrt is not None:  # pragma: no cover - Windows
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+
 
 
 def _corrupt_handoff(
@@ -255,6 +313,208 @@ class ProjectStore:
         self.config = config
 
     # ------------------------------------------------------------------
+    # Cross-process locking (H-04)
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _lock_path(
+        self,
+        path: Path,
+        *,
+        shared: bool = False,
+        timeout: float = 60.0,
+    ) -> Iterator[None]:
+        """Hold an OS-level advisory lock on `path` (created if needed).
+
+        The in-process asyncio lock in `server.py` serializes calls within one
+        server; this serializes *processes*. `flock` releases automatically on
+        process death, so a crash cannot leave a permanent lock.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        if msvcrt is not None and os.fstat(fd).st_size == 0:  # pragma: no cover
+            os.write(fd, b"\0")
+        deadline = time.monotonic() + timeout
+        acquired = False
+        try:
+            while True:
+                try:
+                    _lock_file(fd, shared=shared, blocking=False)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError) as exc:
+                    if time.monotonic() >= deadline:
+                        raise ProjectBusy(
+                            f"project is busy (lock {path.name}); another "
+                            "orchestrator holds it"
+                        ) from exc
+                    time.sleep(0.1)
+            yield
+        finally:
+            if acquired:
+                try:
+                    _unlock_file(fd)
+                except OSError:
+                    pass
+            os.close(fd)
+
+    def project_lock(
+        self,
+        project_id: str,
+        *,
+        shared: bool = False,
+        timeout: float = 60.0,
+    ) -> contextlib.AbstractContextManager[None]:
+        """Exclusive per-project lock for mutations; shared for reads."""
+        return self._lock_path(
+            self.zenith_runtime_dir(project_id) / "project.lock",
+            shared=shared,
+            timeout=timeout,
+        )
+
+    def global_lock(
+        self, name: str, *, timeout: float = 60.0
+    ) -> contextlib.AbstractContextManager[None]:
+        """A named lock under `$ZENITH_HOME/.locks` (e.g. project start)."""
+        safe = safe_path_component(name, kind="lock name")
+        return self._lock_path(
+            self.config.harness_home / ".locks" / f"{safe}.lock",
+            timeout=timeout,
+        )
+
+    # ------------------------------------------------------------------
+    # Decision journal (H-02)
+    # ------------------------------------------------------------------
+
+    def decision_journal_path(self, project_id: str) -> Path:
+        return self.zenith_runtime_dir(project_id) / "decision-journal.json"
+
+    def begin_decision_journal(
+        self,
+        project_id: str,
+        paths: list[Path],
+        *,
+        directories: list[Path] | None = None,
+    ) -> Path:
+        """Snapshot the pre-images of every file a decision batch will touch.
+
+        The journal is written *before* the first mutation. If the process
+        dies mid-commit, the next tool call rolls the pre-images back, so the
+        operator can retry the same decision instead of being stuck on a
+        partially applied patch. Contents are base64 so arbitrary bytes
+        round-trip exactly.
+        """
+        entries: dict[str, str | None] = {}
+        for path in paths:
+            try:
+                entries[str(path)] = base64.b64encode(path.read_bytes()).decode("ascii")
+            except FileNotFoundError:
+                entries[str(path)] = None
+            except OSError as exc:
+                raise CorruptArtifact(path, f"cannot snapshot for journal: {exc}") from exc
+        dir_entries: dict[str, list[str]] = {}
+        for directory in directories or []:
+            try:
+                dir_entries[str(directory)] = sorted(
+                    child.name for child in directory.iterdir() if child.is_file()
+                )
+            except FileNotFoundError:
+                dir_entries[str(directory)] = []
+        journal = self.decision_journal_path(project_id)
+        atomic_write_json(
+            journal,
+            {
+                "created_at": utc_now_iso(),
+                "paths": entries,
+                "directories": dir_entries,
+            },
+        )
+        return journal
+
+    def rollback_decision_journal(self, project_id: str) -> bool:
+        """Restore every journaled pre-image; returns True when it rolled back."""
+        journal = self.decision_journal_path(project_id)
+        if not journal.exists():
+            return False
+        try:
+            data = json.loads(journal.read_text(encoding="utf-8"))
+            entries = data.get("paths") or {}
+            directories = data.get("directories") or {}
+            for raw_path, encoded in entries.items():
+                path = Path(raw_path)
+                if encoded is None:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(base64.b64decode(encoded))
+            for raw_dir, before in directories.items():
+                directory = Path(raw_dir)
+                if not directory.exists():
+                    continue
+                keep = set(before)
+                for child in directory.iterdir():
+                    if child.is_file() and child.name not in keep:
+                        try:
+                            child.unlink()
+                        except OSError:
+                            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.error("decision journal rollback failed for %s: %s", project_id, exc)
+            return False
+        try:
+            journal.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+
+    def finish_decision_journal(self, project_id: str) -> None:
+        try:
+            self.decision_journal_path(project_id).unlink()
+        except FileNotFoundError:
+            pass
+
+    def recover_decision_journal(self, project_id: str) -> bool:
+        """Roll back an interrupted decision commit, if one is on disk."""
+        journal = self.decision_journal_path(project_id)
+        if not journal.exists():
+            return False
+        logger.warning(
+            "rolling back an interrupted decision commit for %s (journal %s)",
+            project_id,
+            journal,
+        )
+        return self.rollback_decision_journal(project_id)
+
+    # ------------------------------------------------------------------
+    # Artifact readers (M-01)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_model(path: Path, adapter, *, kind: str):
+        """Read+validate a JSON artifact, converting every parse failure.
+
+        `kind` is only used in the error text. FileNotFoundError is preserved
+        so callers can distinguish "first run" from "damaged".
+        """
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CorruptArtifact(path, f"cannot read {kind}: {exc}") from exc
+        try:
+            validate = getattr(adapter, "validate_json", None)
+            if validate is not None:
+                return validate(raw)
+            return adapter.model_validate_json(raw)
+        except Exception as exc:  # noqa: BLE001 — pydantic ValidationError et al.
+            raise CorruptArtifact(path, f"invalid {kind}: {exc}") from exc
+
+
+    # ------------------------------------------------------------------
     # Bucket path accessors
     #
     # Every id below reaches the filesystem, so each one is validated as a
@@ -315,6 +575,7 @@ class ProjectStore:
         workspace_dir: str | Path,
         *,
         project_id: str | None = None,
+        request_id: str | None = None,
     ) -> ProjectRecord:
         ws = Path(workspace_dir).expanduser().resolve()
         if not ws.exists():
@@ -378,6 +639,7 @@ class ProjectStore:
             id=pid,
             workspace_dir=str(ws),
             created_at=utc_now_iso(),
+            request_id=request_id,
         )
         atomic_write_json(runtime / "project.json", record.model_dump(mode="json"))
         return record
@@ -386,7 +648,7 @@ class ProjectStore:
         path = self.zenith_runtime_dir(project_id) / "project.json"
         if not path.exists():
             raise FileNotFoundError(f"project not found: {project_id}")
-        return ProjectRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        return self._load_model(path, ProjectRecord, kind="project.json")
 
     def save_project(self, record: ProjectRecord) -> None:
         atomic_write_json(
@@ -435,6 +697,17 @@ class ProjectStore:
         result.sort(key=lambda r: r.created_at, reverse=True)
         return result
 
+    def find_project_by_request_id(self, request_id: str) -> ProjectRecord | None:
+        """Return the project created for `request_id`, if one exists.
+
+        `list_projects` already skips unreadable records; a corrupt record
+        therefore cannot mask a matching healthy one.
+        """
+        for record in self.list_projects():
+            if record.request_id == request_id:
+                return record
+        return None
+
     # ------------------------------------------------------------------
     # ProjectState (cursor)
     # ------------------------------------------------------------------
@@ -445,8 +718,8 @@ class ProjectStore:
             return None
         from pydantic import TypeAdapter
 
-        return TypeAdapter(ProjectState).validate_json(
-            path.read_text(encoding="utf-8")
+        return self._load_model(
+            path, TypeAdapter(ProjectState), kind="state.json"
         )
 
     def save_state(self, project_id: str, state: ProjectState) -> None:
@@ -472,7 +745,7 @@ class ProjectStore:
         path = self.mission_runtime_dir(project_id, mission_id) / "tasks.json"
         if not path.exists():
             raise FileNotFoundError(f"tasks.json missing for {project_id}/{mission_id}")
-        return TaskList.model_validate_json(path.read_text(encoding="utf-8"))
+        return self._load_model(path, TaskList, kind="tasks.json")
 
     def save_task_list(self, project_id: str, mission_id: str, tl: TaskList) -> None:
         atomic_write_json(
@@ -515,7 +788,7 @@ class ProjectStore:
         path = self.mission_runtime_dir(project_id, mission_id) / "task-state.json"
         if not path.exists():
             return TaskStateFile()
-        return TaskStateFile.model_validate_json(path.read_text(encoding="utf-8"))
+        return self._load_model(path, TaskStateFile, kind="task-state.json")
 
     def save_task_state(
         self, project_id: str, mission_id: str, task_state: TaskStateFile
@@ -533,9 +806,7 @@ class ProjectStore:
         )
         if not path.exists():
             return ContractStateFile()
-        return ContractStateFile.model_validate_json(
-            path.read_text(encoding="utf-8")
-        )
+        return self._load_model(path, ContractStateFile, kind="contract-state.json")
 
     def save_contract_state(
         self, project_id: str, mission_id: str, contract_state: ContractStateFile
@@ -685,7 +956,13 @@ class ProjectStore:
         """
         stem = path.stem
         inferred_node = node_id or (stem.split("__", 1)[1] if "__" in stem else stem)
-        raw = path.read_text(encoding="utf-8")
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            quarantine_corrupt(path, reason=f"unreadable handoff: {exc}")
+            return _corrupt_handoff(
+                inferred_node, task_type, f"corrupt handoff file ({exc})"
+            )
         try:
             data = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -739,9 +1016,7 @@ class ProjectStore:
         path = self.zenith_runtime_dir(project_id) / "attention.json"
         if not path.exists():
             return []
-        return AttentionFile.model_validate_json(
-            path.read_text(encoding="utf-8")
-        ).items
+        return self._load_model(path, AttentionFile, kind="attention.json").items
 
     def save_attention(
         self, project_id: str, items: list[AttentionItemInternal]

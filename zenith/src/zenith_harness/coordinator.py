@@ -10,6 +10,7 @@ import concurrent.futures
 import logging
 import secrets
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 from . import attention as attn_factory
@@ -32,6 +33,7 @@ from .models import (
     Task,
     TaskList,
     TaskStateFile,
+    TerminalReviewHandoff,
     ValidateHandoff,
     WorkHandoff,
 )
@@ -151,7 +153,9 @@ class MissionCoordinator:
 
     def _dispatch_one(self, mid: str, task: Task) -> StepResult:
         """Original serial dispatch path, retained for max_parallel=1."""
-        spawn_ts = utc_now_filesafe()
+        # Same-second retries used to reuse the attempt path; use the batch
+        # token here too (I-02).
+        spawn_ts = self._batch_spawn_ts(0)
         task_state = self.store.load_task_state(self.project_id, mid)
         task_state.set_status(task.id, "running")
         task_state.set_last_attempt(task.id, spawn_ts)
@@ -750,11 +754,47 @@ class MissionCoordinator:
         try:
             report = self.terminal_reviewer.review(self.project_id, mid, spawn_ts)
         except Exception as exc:  # noqa: BLE001
-            self.store.save_state(
-                self.project_id,
-                Failed(reason=f"Terminal reviewer crashed: {exc}"),
+            # H-03: a transient reviewer crash must not destroy the mission.
+            # Raise a retryable attention item; a `continue` decision returns
+            # the state to MissionRunning so end_mission can try again.
+            report = TerminalReviewHandoff(
+                done=False,
+                report=(
+                    f"Terminal reviewer crashed: {exc}. "
+                    "Decide `continue` to retry the terminal review, or "
+                    "patch/abort if the reviewer is misconfigured."
+                ),
             )
-            return StepResult.terminal("terminal_review_crash")
+            self._raise_attention([attn_factory.terminal_review(mid, report)])
+            return StepResult.attention_needed("terminal_review")
+
+        # M-11: a `done=true` verdict must cite at least one real path inside
+        # the workspace. The reviewer MCP tool enforces this; this is the
+        # coordinator-side check for any other TerminalReviewer implementation.
+        if report.done and report.evidence:
+            workspace = Path(self.store.workspace_dir(self.project_id)).resolve()
+            bad: list[str] = []
+            for raw in report.evidence:
+                candidate = Path(raw)
+                if not candidate.is_absolute():
+                    candidate = workspace / candidate
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    bad.append(raw)
+                    continue
+                if not resolved.is_relative_to(workspace) or not resolved.exists():
+                    bad.append(raw)
+            if bad:
+                report = TerminalReviewHandoff(
+                    done=False,
+                    report=(
+                        "Terminal review rejected: evidence path(s) do not "
+                        f"exist inside the workspace: {', '.join(bad)}. "
+                        "The reviewer must cite real, workspace-relative paths."
+                    ),
+                )
+
         self.store.save_terminal_review(self.project_id, mid, spawn_ts, report)
         if report.done:
             self.store.seal_mission(
@@ -777,7 +817,8 @@ class MissionCoordinator:
         combined = attn_factory.cap_attention_items([*existing, *items])
         if len(combined) < len(existing) + len(items):
             logger.warning(
-                "attention queue capped at %s items (dropped %s old checkpoint(s))",
+                "attention checkpoints capped at %s items (dropped %s old "
+                "checkpoint(s); actionable items are always kept)",
                 attn_factory.MAX_OPEN_ATTENTION_ITEMS,
                 len(existing) + len(items) - len(combined),
             )

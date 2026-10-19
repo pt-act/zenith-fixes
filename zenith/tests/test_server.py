@@ -220,10 +220,15 @@ async def test_submit_terminal_review_writes_file(tmp_path: Path, monkeypatch) -
     monkeypatch.setenv("ZENITH_TERMINAL_REVIEW_PATH", str(review_path))
     server = create_terminal_reviewer_server()
     await server.call_tool(
-        "submit_terminal_review", {"done": True, "report": "all clean"}
+        "submit_terminal_review",
+        {"done": True, "report": "all clean", "evidence": ["README.md"]},
     )
     data = json.loads(review_path.read_text())
-    assert data == {"done": True, "report": "all clean"}
+    assert data == {
+        "done": True,
+        "report": "all clean",
+        "evidence": ["README.md"],
+    }
 
 
 # ---------------------------------------------------------------------------

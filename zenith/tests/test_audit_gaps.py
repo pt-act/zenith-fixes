@@ -233,7 +233,9 @@ def test_cli_abort_project_marks_the_project_aborted(
 
     record = store.create_project("abort me", _workspace(tmp_path))
 
-    result = CliRunner().invoke(cli, ["abort-project", record.id, "--reason", "test"])
+    result = CliRunner().invoke(
+        cli, ["abort-project", record.id, "--reason", "test", "--yes"]
+    )
 
     assert result.exit_code == 0, result.output
     assert store.load_state(record.id).state == "aborted"

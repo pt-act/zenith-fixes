@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -79,7 +80,7 @@ _STATE_LABELS = {
     "attention_needed": "attention needed (decide every open item)",
     "done": "done",
     "failed": "failed",
-    "aborted": "aborted",
+    "aborted": "mission stopped",
 }
 
 
@@ -299,10 +300,20 @@ def inspect_tasks_cmd(project_id: str, mission_id: str | None) -> None:
 @cli.command("abort-project")
 @click.argument("project_id")
 @click.option("--reason", required=True)
-def abort_project_cmd(project_id: str, reason: str) -> None:
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip the confirmation prompt (for scripts).",
+)
+def abort_project_cmd(project_id: str, reason: str, yes: bool) -> None:
     """Mark a project Aborted (CLI-side: preserves tasks.json + attempts/)."""
     from .controller import build_controller
 
+    if not yes:
+        click.confirm(
+            f"Abort {project_id}? This is terminal and cannot be undone.",
+            abort=True,
+        )
     config = HarnessConfig.discover()
     # Same construction as the MCP server (M-9); abort never dispatches, but
     # sharing the factory keeps the two surfaces from drifting.
@@ -480,7 +491,12 @@ def _resolve_acp_command(command: str) -> str:
     if not command:
         return command
     try:
-        parts = shlex.split(command)
+        if os.name == "nt":
+            from .acp_runner import _split_command
+
+            parts = _split_command(command, posix=False)
+        else:
+            parts = shlex.split(command)
     except ValueError:
         # An unbalanced quote is an operator error; leave the string untouched
         # and let the spawn path report it rather than silently rewriting it.
@@ -490,9 +506,13 @@ def _resolve_acp_command(command: str) -> str:
     executable = shutil.which(parts[0])
     if executable is None:
         return command
-    # shlex.join re-quotes arguments so the later exec-side shlex.split
-    # reconstructs the same argv (paths with spaces survive).
-    return shlex.join([executable, *parts[1:]])
+    # Re-quote arguments so the later exec-side split reconstructs the same
+    # argv (paths with spaces survive). Windows needs list2cmdline, not POSIX
+    # single quotes.
+    argv = [executable, *parts[1:]]
+    if os.name == "nt":
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
 
 
 def _mcp_server_args() -> list[str]:
@@ -547,7 +567,6 @@ def _write_bootstrap_config(
         env_lines = "\n".join(f"{k} = {json.dumps(v)}" for k, v in env.items())
         block = (
             'model = "gpt-5.5"\n'
-            'sandbox_mode = "danger-full-access"\n'
             'model_reasoning_effort = "xhigh"\n'
             '[features]\n'
             'memories = true\n'
