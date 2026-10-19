@@ -44,6 +44,8 @@ def config(harness_home: Path) -> HarnessConfig:
         terminal_reviewer_provider_name=None,
         terminal_reviewer_acp_command=None,
         max_parallel_nodes=1,
+        # This suite exercises the workspace skill-sync surface.
+        workspace_shims=True,
     )
 
 

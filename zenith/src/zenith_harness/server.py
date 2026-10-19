@@ -16,8 +16,7 @@ from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from pydantic import Field
 
 from .config import HarnessConfig
-from .controller import ProjectController, ToolError
-from .dispatcher import NodeDispatcher, TerminalReviewer
+from .controller import ProjectController, ToolError, build_controller
 from .models import (
     Decision,
     TaskList,
@@ -42,15 +41,8 @@ def create_orchestrator_server(
 ) -> FastMCP:
     """7 orchestrator tools, registered on a stdio MCP server."""
     if controller is None:
-        from .dispatcher import MockDispatcher, MockTerminalReviewer
-
-        controller = ProjectController(
-            config,
-            MockDispatcher(
-                lambda r: WorkHandoff(node_id=r.task.id, done=False, report="no ACP wired")
-            ),
-            MockTerminalReviewer(TerminalReviewHandoff(done=True, report="")),
-        )
+        # Same factory as the CLI and the server entrypoint (M-9).
+        controller = build_controller(config)
 
     mcp = FastMCP(
         name="zenith",
@@ -463,25 +455,8 @@ def main() -> None:
 
     if args.mode == "orchestrator":
         config = HarnessConfig.discover()
-        # Production: wire the ACP dispatcher from acp_runner.
-        dispatcher: NodeDispatcher
-        reviewer: TerminalReviewer
-        try:
-            from .acp_runner import ACPNodeDispatcher, ACPTerminalReviewer  # noqa: PLC0415
-
-            dispatcher = ACPNodeDispatcher(config)
-            reviewer = ACPTerminalReviewer(config)
-        except Exception as exc:  # pragma: no cover — diagnostic
-            logger.warning("Falling back to no-op dispatcher: %s", exc)
-            from .dispatcher import MockDispatcher, MockTerminalReviewer  # noqa: PLC0415
-
-            dispatcher = MockDispatcher(
-                lambda r: WorkHandoff(
-                    node_id=r.task.id, done=False, report="no ACP runtime available"
-                )
-            )
-            reviewer = MockTerminalReviewer(TerminalReviewHandoff(done=True, report=""))
-        controller = ProjectController(config, dispatcher, reviewer)
+        # One construction path shared with the CLI (M-9).
+        controller = build_controller(config)
         server = create_orchestrator_server(config, controller)
     elif args.mode == "worker":
         server = create_worker_server()

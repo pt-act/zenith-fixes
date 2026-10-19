@@ -15,6 +15,47 @@ def _new_id(prefix: str) -> str:
     return f"att-{prefix}-{secrets.token_hex(3)}"
 
 
+# A long mission raises one gate_checkpoint per cleared gate and nothing aged
+# them out, so the open queue grew with mission length and every
+# decide_attention had to resolve the whole set. Keep it bounded: dedupe by id,
+# then drop the oldest checkpoints first (they are advisory records of a gate
+# that already cleared), and only then the oldest items of any kind. A burst of
+# checkpoints can never displace an actionable failure.
+MAX_OPEN_ATTENTION_ITEMS = 64
+
+
+def cap_attention_items(
+    items: list[AttentionItemInternal],
+    *,
+    max_items: int = MAX_OPEN_ATTENTION_ITEMS,
+) -> list[AttentionItemInternal]:
+    """Bound the attention queue, preferring to drop old checkpoints."""
+    deduped: list[AttentionItemInternal] = []
+    seen: set[str] = set()
+    for item in items:
+        if item.id in seen:
+            continue
+        seen.add(item.id)
+        deduped.append(item)
+
+    overflow = len(deduped) - max_items
+    if overflow <= 0:
+        return deduped
+
+    dropped: set[int] = set()
+    for index, item in enumerate(deduped):
+        if len(dropped) >= overflow:
+            break
+        if item.kind == "gate_checkpoint":
+            dropped.add(index)
+    if len(dropped) < overflow:
+        for index in range(len(deduped)):
+            if len(dropped) >= overflow:
+                break
+            dropped.add(index)
+    return [item for index, item in enumerate(deduped) if index not in dropped]
+
+
 def _handoff_report(task: Task, handoff: WorkHandoff | ValidateHandoff) -> str:
     lines = [
         f"Task report from {task.id}",
@@ -190,6 +231,8 @@ def terminal_review(
 
 
 __all__ = [
+    "MAX_OPEN_ATTENTION_ITEMS",
+    "cap_attention_items",
     "node_failed",
     "node_attention",
     "gate_failed",

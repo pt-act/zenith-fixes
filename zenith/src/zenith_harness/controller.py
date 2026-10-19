@@ -10,6 +10,7 @@ The coordinator is constructed per-invocation; it has no in-memory state.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from .config import HarnessConfig
@@ -39,6 +40,8 @@ from .task_validation import (
     parse_contract_dir,
     validate_task_list_submission,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -228,7 +231,7 @@ class ProjectController:
             open_items,
             decision_number=plan.decision_number,
         )
-        self.store.clear_attention(project_id)
+        self.store.consume_attention(project_id, {d.item_id for d in decisions})
         self.store.save_state(project_id, next_state)
         return self._build_envelope(project_id, dag_mode="none")
 
@@ -566,9 +569,38 @@ class ProjectController:
         return state
 
 
+def build_controller(config: HarnessConfig) -> ProjectController:
+    """Construct the controller used by the MCP server AND the CLI (M-9).
+
+    `server.main` used to wire the ACP dispatcher while `zenith abort-project`
+    built its own controller around MockDispatcher/MockTerminalReviewer, so the
+    two surfaces could drift. Both now go through this factory; the ACP import
+    failure path falls back to no-op collaborators in exactly one place.
+    """
+    try:
+        from .acp_runner import ACPNodeDispatcher, ACPTerminalReviewer
+
+        dispatcher: NodeDispatcher = ACPNodeDispatcher(config)
+        reviewer: TerminalReviewer = ACPTerminalReviewer(config)
+    except Exception as exc:  # pragma: no cover — diagnostic
+        logger.warning("Falling back to no-op dispatcher: %s", exc)
+        from .dispatcher import MockDispatcher, MockTerminalReviewer
+        from .models import TerminalReviewHandoff, WorkHandoff
+
+        dispatcher = MockDispatcher(
+            lambda r: WorkHandoff(
+                node_id=r.task.id, done=False, report="no ACP runtime available"
+            )
+        )
+        reviewer = MockTerminalReviewer(
+            TerminalReviewHandoff(done=True, report="")
+        )
+    return ProjectController(config, dispatcher, reviewer)
+
+
 def _make_pending():
     from .models import ContractStateEntry
     return ContractStateEntry()
 
 
-__all__ = ["ProjectController", "ToolError"]
+__all__ = ["ProjectController", "ToolError", "build_controller"]

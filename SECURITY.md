@@ -20,13 +20,36 @@ Zenith runs coding agents that can execute commands and modify files in the work
 Zenith is a harness for **untrusted** agents: a worker is treated as an
 adversary that will attempt to escape its sandbox, read credentials, and report
 success it did not achieve. The following boundaries are enforced in code, and
-each has a regression test in `tests/test_audit_regressions.py`.
+each has a regression test in `tests/test_audit_regressions.py` or
+`tests/test_audit_gaps.py`.
 
 ### Workspace confinement
 
 ACP `fs/read_text_file` and `fs/write_text_file` requests are resolved and then
 required to stay inside the session workspace. `../` traversal, absolute paths,
 and symlinked parents that escape are all refused.
+
+### Workspace mutation is opt-in
+
+`start_project` / `advance_project` do **not** write into the user's repository.
+The host-agent skill shims (`.agents/skills`, `.claude/skills`,
+`.codex/skills`, `AGENTS.md`) are created only when the operator asks for them:
+
+```bash
+export ZENITH_WORKSPACE_SHIMS=1
+```
+
+Replacing a real (bootstrap-only) skill directory with a symlink deletes it, so
+that additionally requires `ZENITH_REPLACE_BOOTSTRAP_SKILLS=1`; without it the
+two trees are merged and the directory is preserved. `zenith init` still writes
+the configuration files the operator explicitly ran it to create.
+
+### ACP launch is exec, never a shell
+
+The adapter command is configuration, but it is not code: it is split with
+`shlex` and passed to `create_subprocess_exec`. Shell metacharacters in the
+command (or in any value spliced into it) are literal argv tokens the adapter
+rejects, not commands the host runs.
 
 ### Agent command execution is opt-in
 
@@ -95,6 +118,15 @@ stage it.
 If you ran an earlier version of `zenith init` with credentials in the
 environment, **rotate those keys**: the values were written to `.mcp.json` in
 cleartext.
+
+## Dependency and release policy
+
+Runtime dependencies are pinned to compatible-minor ranges (`~=`) and resolved
+through the committed `uv.lock`; the documented install path and CI both run
+`uv sync --frozen`, so a build uses the reviewed lockfile rather than resolving
+new versions. Dependency bumps are reviewed changes, not automatic updates.
+Releases are tagged from `main` after the full test suite passes; security fixes
+land on the latest tag.
 
 ## Supported versions
 

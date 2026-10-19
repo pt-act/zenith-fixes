@@ -8,7 +8,7 @@ The Python package lives in [`zenith/`](zenith/). You need Python 3.11+ and [`uv
 
 ```bash
 cd zenith
-uv sync
+uv sync --frozen
 ```
 
 ## Running the checks

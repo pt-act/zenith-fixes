@@ -15,7 +15,7 @@ Requirements:
 Install Zenith from this repository:
 
 ```bash
-uv sync
+uv sync --frozen
 uv run zenith --help
 ```
 

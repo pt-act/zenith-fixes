@@ -179,6 +179,47 @@ def _augment_acp_command(
     return command
 
 
+def _acp_argv(command: str) -> list[str]:
+    """Split an operator-supplied ACP command into an argv for ``exec``.
+
+    The command is configuration, but it used to be handed to a shell, so
+    metacharacters in it -- or in any value spliced into it -- were
+    interpreted. ``shlex`` preserves quoted arguments and leaves ``;``,
+    ``|`` and ``$()`` as literal tokens, which ``exec`` then passes to the
+    adapter as ordinary argv entries (and the adapter rejects).
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ACPError(f"invalid ACP command {command!r}: {exc}") from exc
+    if not argv:
+        raise ACPError("ACP command is empty")
+    return argv
+
+
+async def _spawn_acp_process(
+    command: str, *, cwd: str, env: dict[str, str]
+) -> asyncio.subprocess.Process:
+    """Spawn the ACP adapter with exec semantics (never a shell).
+
+    H-9: the launch string is operator config, but the old
+    ``create_subprocess_shell`` call meant a shell parsed it. Anything able to
+    influence the string (a prompt-injected worker writing to a profile, a
+    wrapper that sets the env after import) got a command-injection surface.
+    Exec receives the split argv verbatim; shell syntax becomes a literal
+    argument the adapter fails on, instead of code the host runs.
+    """
+    return await asyncio.create_subprocess_exec(
+        *_acp_argv(command),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        limit=SUBPROCESS_STREAM_LIMIT,
+    )
+
+
 def _parse_codex_c_overrides(command: str) -> dict[str, Any]:
     """Read -c/--config assignments after shell quoting; the last value wins.
 
@@ -1014,15 +1055,9 @@ class ACPNodeRunner:
             project_id=project_id,
         )
 
-        # 3) Spawn the ACP agent.
-        process = await asyncio.create_subprocess_shell(
-            acp_command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workspace_dir,
-            env=acp_env,
-            limit=SUBPROCESS_STREAM_LIMIT,
+        # 3) Spawn the ACP agent. exec (not shell): H-9.
+        process = await _spawn_acp_process(
+            acp_command, cwd=workspace_dir, env=acp_env
         )
         progress_tracker = ACPProgressTracker(callback=progress_callback)
         client = ACPClient(
@@ -1197,14 +1232,10 @@ class ACPNodeRunner:
             workspace_dir=workspace_dir,
         )
 
-        process = await asyncio.create_subprocess_shell(
-            acp_command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workspace_dir,
-            env=acp_env,
-            limit=SUBPROCESS_STREAM_LIMIT,
+        # exec (not shell): H-9. The reviewer launch string is operator config
+        # and is never parsed by a shell.
+        process = await _spawn_acp_process(
+            acp_command, cwd=workspace_dir, env=acp_env
         )
         tracker = ACPProgressTracker(callback=progress_callback)
         client = ACPClient(

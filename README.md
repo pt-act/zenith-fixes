@@ -60,7 +60,7 @@ Then, in Claude Code or Codex, type:
 
 ```bash
 cd zenith
-uv sync
+uv sync --frozen
 uv run zenith --help
 ```
 

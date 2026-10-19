@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -787,8 +788,11 @@ def test_attention_item_exposes_kind() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_workspace_shims_are_relative(store: ProjectStore, tmp_path: Path) -> None:
+def test_workspace_shims_are_relative(
+    store: ProjectStore, tmp_path: Path
+) -> None:
     """H-5: an absolute symlink is machine-specific and leaks the home layout."""
+    store.config = replace(store.config, workspace_shims=True)
     workspace = tmp_path / "ws"
     workspace.mkdir()
     store.create_project("shim check", workspace)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -300,16 +301,12 @@ def inspect_tasks_cmd(project_id: str, mission_id: str | None) -> None:
 @click.option("--reason", required=True)
 def abort_project_cmd(project_id: str, reason: str) -> None:
     """Mark a project Aborted (CLI-side: preserves tasks.json + attempts/)."""
-    from .controller import ProjectController
-    from .dispatcher import MockDispatcher, MockTerminalReviewer
-    from .models import TerminalReviewHandoff, WorkHandoff
+    from .controller import build_controller
 
     config = HarnessConfig.discover()
-    controller = ProjectController(
-        config,
-        MockDispatcher(lambda r: WorkHandoff(node_id=r.task.id, done=False, report="aborted")),
-        MockTerminalReviewer(TerminalReviewHandoff(done=True, report="")),
-    )
+    # Same construction as the MCP server (M-9); abort never dispatches, but
+    # sharing the factory keeps the two surfaces from drifting.
+    controller = build_controller(config)
     env = controller.abort_project(project_id, reason)
     click.echo(f"Aborted {project_id}: state={_state_label(env.state)}")
 
@@ -465,8 +462,10 @@ def _zenith_project_root() -> Path:
         if 'name = "zenith-harness"' in text:
             return candidate
     raise click.ClickException(
-        "Could not locate the Zenith uv project root. Run `zenith init` from a "
-        "Zenith source checkout with pyproject.toml available."
+        f"Could not locate the Zenith uv project root from {start}: no parent "
+        "directory has a pyproject.toml declaring name = \"zenith-harness\". "
+        "Run `zenith init` from the source checkout (or a copy of it); the "
+        "generated .mcp.json needs that path to launch zenith-server."
     )
 
 
@@ -480,13 +479,20 @@ def _resolve_acp_command(command: str) -> str:
     """
     if not command:
         return command
-    parts = command.split()
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        # An unbalanced quote is an operator error; leave the string untouched
+        # and let the spawn path report it rather than silently rewriting it.
+        return command
     if not parts:
         return command
     executable = shutil.which(parts[0])
     if executable is None:
         return command
-    return " ".join([executable, *parts[1:]])
+    # shlex.join re-quotes arguments so the later exec-side shlex.split
+    # reconstructs the same argv (paths with spaces survive).
+    return shlex.join([executable, *parts[1:]])
 
 
 def _mcp_server_args() -> list[str]:

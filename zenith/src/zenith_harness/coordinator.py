@@ -7,6 +7,7 @@ tool loops `step()` until a returnable condition.
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import secrets
 from dataclasses import dataclass, field
 from typing import Literal
@@ -36,6 +37,8 @@ from .models import (
 )
 from .storage import ProjectStore, utc_now_filesafe
 from .envelope import public_attention_items
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -771,11 +774,17 @@ class MissionCoordinator:
 
     def _raise_attention(self, items: list[AttentionItemInternal]) -> None:
         existing = self.store.load_attention(self.project_id)
-        existing.extend(items)
-        self.store.save_attention(self.project_id, existing)
+        combined = attn_factory.cap_attention_items([*existing, *items])
+        if len(combined) < len(existing) + len(items):
+            logger.warning(
+                "attention queue capped at %s items (dropped %s old checkpoint(s))",
+                attn_factory.MAX_OPEN_ATTENTION_ITEMS,
+                len(existing) + len(items) - len(combined),
+            )
+        self.store.save_attention(self.project_id, combined)
         self.store.save_state(
             self.project_id,
-            AttentionNeeded(items=public_attention_items(existing)),
+            AttentionNeeded(items=public_attention_items(combined)),
         )
 
     # ------------------------------------------------------------------

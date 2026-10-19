@@ -368,7 +368,10 @@ class ProjectStore:
         self._seed_bundled_skills(zenith / "skills")
 
         # 7) Workspace symlink shims (host-agent native discovery surface).
-        self._ensure_symlink_shims(ws, zenith)
+        #    Opt-in only (H-5): start_project runs against the user's own repo,
+        #    so it may not create .agents/.claude/.codex/AGENTS.md unasked.
+        if self.config.workspace_shims:
+            self._ensure_symlink_shims(ws, zenith)
 
         # 8) project.json (orchestrator-only cursor)
         record = ProjectRecord(
@@ -404,7 +407,8 @@ class ProjectStore:
         target_skills = zenith / "skills"
         self._import_workspace_skills(ws, target_skills)
         self._seed_bundled_skills(target_skills)
-        self._ensure_symlink_shims(ws, zenith)
+        if self.config.workspace_shims:
+            self._ensure_symlink_shims(ws, zenith)
 
     def list_projects(self) -> list[ProjectRecord]:
         if not self.config.projects_dir.exists():
@@ -750,6 +754,21 @@ class ProjectStore:
     def clear_attention(self, project_id: str) -> None:
         self.save_attention(project_id, [])
 
+    def consume_attention(self, project_id: str, item_ids: set[str]) -> None:
+        """Remove exactly the items resolved by a decision batch.
+
+        `clear_attention` was the old semantics; consuming by id keeps the
+        "which decision resolved which item" relation explicit, so a future
+        advisory item (e.g. an auto-acknowledged checkpoint) cannot be dropped
+        by a batch that never decided it.
+        """
+        if not item_ids:
+            return
+        remaining = [
+            item for item in self.load_attention(project_id) if item.id not in item_ids
+        ]
+        self.save_attention(project_id, remaining)
+
     # ------------------------------------------------------------------
     # Decisions audit
     # ------------------------------------------------------------------
@@ -983,6 +1002,11 @@ class ProjectStore:
         if link.exists():
             if link.is_dir():
                 if self._is_bootstrap_skill_dir(link):
+                    if not self.config.replace_bootstrap_skills:
+                        # Replacing a real directory deletes it. Merge instead
+                        # unless the operator explicitly opted in (H-5).
+                        self._copy_missing_tree(target_abs, link)
+                        return
                     shutil.rmtree(link)
                     link.symlink_to(link_target)
                     return

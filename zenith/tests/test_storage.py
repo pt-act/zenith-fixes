@@ -34,6 +34,9 @@ def config(harness_home: Path) -> HarnessConfig:
         validator_acp_command=None,
         terminal_reviewer_provider_name=None,
         terminal_reviewer_acp_command=None,
+        # This module exercises the shim feature; production defaults it off.
+        workspace_shims=True,
+        replace_bootstrap_skills=True,
     )
 
 

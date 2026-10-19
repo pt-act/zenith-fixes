@@ -14,6 +14,7 @@ Attempt filenames keep the `<ts>__<node_id>.json` token for on-disk continuity
 from __future__ import annotations
 
 import re
+import time
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -228,6 +229,9 @@ class AttentionItemInternal(AttentionItem):
     kind: AttentionKind
     mission_id: str
     node_id: str | None = None
+    # Monotonic enough for queue ageing/capping; old attention.json files
+    # without it validate to "now", which keeps the item rather than dropping it.
+    created_at: float = Field(default_factory=time.time)
 
 # ---------------------------------------------------------------------------
 # ProjectState (discriminated union)

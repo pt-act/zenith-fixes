@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import tomllib
 from pathlib import Path
 
@@ -198,14 +199,15 @@ class TestInit:
         server_env = config["mcp_servers"]["zenith"]["env"]
         # The command is preserved apart from bare-name PATH resolution (the
         # adapter name is rewritten to an absolute path at init time so a
-        # desktop-launched session does not depend on inherited PATH).
-        assert server_env["ZENITH_WORKER_ACP_COMMAND"].endswith(
-            worker_cmd[len("codex-acp"):]
-        )
-        assert server_env["ZENITH_VALIDATOR_ACP_COMMAND"].endswith(
-            validator_cmd[len("codex-acp"):]
-        )
-        assert '"gpt-5.6-luna"' in server_env["ZENITH_WORKER_ACP_COMMAND"]
+        # desktop-launched session does not depend on inherited PATH). Compare
+        # argv, not quoting style: the spawn path shlex-splits with exec.
+        assert shlex.split(server_env["ZENITH_WORKER_ACP_COMMAND"])[1:] == shlex.split(
+            worker_cmd
+        )[1:]
+        assert shlex.split(server_env["ZENITH_VALIDATOR_ACP_COMMAND"])[1:] == shlex.split(
+            validator_cmd
+        )[1:]
+        assert "gpt-5.6-luna" in server_env["ZENITH_WORKER_ACP_COMMAND"]
 
     def test_init_resolves_bare_acp_command_through_path(
         self, runner: CliRunner, workspace: Path, env: dict[str, str]

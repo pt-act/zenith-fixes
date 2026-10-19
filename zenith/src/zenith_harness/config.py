@@ -171,6 +171,14 @@ class HarnessConfig:
     # approval) is the historical behaviour and stays available, but it is now
     # an explicit opt-in instead of an unmarked default.
     allow_unsandboxed: bool = False
+    # Workspace mutation (H-5). start_project/advance_project used to write
+    # .agents/, .claude/, .codex/ and AGENTS.md into the user's repository on
+    # every run. Those writes are now opt-in; `zenith init` still lays down the
+    # config files the user explicitly asked for.
+    workspace_shims: bool = False
+    # Converting a real host skill directory into a symlink deletes it. Only do
+    # that when the operator explicitly allows replacing bootstrap-only dirs.
+    replace_bootstrap_skills: bool = False
 
     @classmethod
     def discover(cls) -> HarnessConfig:
@@ -252,6 +260,12 @@ class HarnessConfig:
             ),
             allow_unsandboxed=_resolve_bool(
                 os.environ.get("ZENITH_ALLOW_UNSANDBOXED"), default=False
+            ),
+            workspace_shims=_resolve_bool(
+                os.environ.get("ZENITH_WORKSPACE_SHIMS"), default=False
+            ),
+            replace_bootstrap_skills=_resolve_bool(
+                os.environ.get("ZENITH_REPLACE_BOOTSTRAP_SKILLS"), default=False
             ),
         )
 
