@@ -25,6 +25,13 @@ from .models import (
     ValidateHandoff,
     WorkHandoff,
 )
+from .sandbox import (
+    Sandbox,
+    SandboxUnavailable,
+    get_sandbox,
+    prepare_node_home,
+    sandbox_env_for_provider,
+)
 from .storage import (
     ProjectStore,
     atomic_write_json,
@@ -325,7 +332,14 @@ def _acp_argv(command: str) -> list[str]:
 
 
 async def _spawn_acp_process(
-    command: str, *, cwd: str, env: dict[str, str]
+    command: str,
+    *,
+    cwd: str,
+    env: dict[str, str],
+    sandbox: Sandbox | None = None,
+    workspace: Path | None = None,
+    home: Path | None = None,
+    extra_ro_paths: tuple[str, ...] = (),
 ) -> asyncio.subprocess.Process:
     """Spawn the ACP adapter with exec semantics (never a shell).
 
@@ -335,9 +349,28 @@ async def _spawn_acp_process(
     wrapper that sets the env after import) got a command-injection surface.
     Exec receives the split argv verbatim; shell syntax becomes a literal
     argument the adapter fails on, instead of code the host runs.
+
+    When a sandbox is configured, the same argv is wrapped in the sandbox
+    launcher. The adapter and every descendant (including provider-internal
+    command execution) inherit the mount/pid namespace.
     """
+    argv = _acp_argv(command)
+    if (
+        sandbox is not None
+        and sandbox.name != "none"
+        and workspace is not None
+        and home is not None
+    ):
+        argv = sandbox.wrap(
+            argv,
+            cwd=Path(cwd),
+            env=env,
+            workspace=workspace,
+            home=home,
+            extra_ro_paths=extra_ro_paths,
+        )
     return await asyncio.create_subprocess_exec(
-        *_acp_argv(command),
+        *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -655,6 +688,9 @@ class ACPClient:
         allow_terminal: bool = False,
         max_terminal_output_bytes: int = 8 * 1024 * 1024,
         request_timeout: float | None = 120.0,
+        sandbox: Sandbox | None = None,
+        sandbox_home: Path | None = None,
+        sandbox_extra_ro_paths: tuple[str, ...] = (),
     ):
         self._process = process
         self._working_dir = working_dir
@@ -680,6 +716,9 @@ class ACPClient:
         self._allow_terminal = allow_terminal
         self._max_terminal_output_bytes = max_terminal_output_bytes
         self._request_timeout = request_timeout
+        self._sandbox = sandbox
+        self._sandbox_home = sandbox_home
+        self._sandbox_extra_ro_paths = sandbox_extra_ro_paths
 
     async def start(self) -> None:
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -1010,10 +1049,24 @@ class ACPClient:
             ):
                 env[var["name"]] = var["value"]
         # exec (not shell) so agent-supplied text cannot be interpreted as
-        # shell syntax.
+        # shell syntax. If a sandbox is configured, the command runs in the
+        # same mount/pid namespace as the agent.
+        argv = [cmd, *args]
+        if (
+            self._sandbox is not None
+            and self._sandbox.name != "none"
+            and self._sandbox_home is not None
+        ):
+            argv = self._sandbox.wrap(
+                argv,
+                cwd=Path(cwd),
+                env=env,
+                workspace=self._workspace_root,
+                home=self._sandbox_home,
+                extra_ro_paths=self._sandbox_extra_ro_paths,
+            )
         process = await asyncio.create_subprocess_exec(
-            cmd,
-            *args,
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=cwd,
@@ -1119,6 +1172,45 @@ class ACPClient:
                     pass
             if close_main_process:
                 await _close_subprocess(self._process, timeout=5)
+
+
+def _sandbox_extra_ro_paths(command: str) -> tuple[str, ...]:
+    """Read-only host trees the adapter/terminal commands need.
+
+    The per-node sandbox only binds the system trees, the workspace, and a
+    temporary home. An adapter installed in a uv tool/venv or ~/.local/bin
+    lives outside those trees, so bind its executable directory (and the
+    running interpreter's prefix) read-only.
+    """
+    paths: list[str] = []
+
+    def add(candidate: Path | str | None) -> None:
+        if not candidate:
+            return
+        try:
+            text = str(Path(candidate).expanduser().resolve())
+        except OSError:
+            return
+        if text and Path(text).exists() and text not in paths:
+            paths.append(text)
+
+    try:
+        argv = _acp_argv(command)
+    except ACPError:
+        argv = []
+    if argv:
+        executable = shutil.which(argv[0]) or argv[0]
+        add(Path(executable).parent)
+        # A wrapper command may be `python /path/to/script.py`; bind the
+        # script's tree too so it exists after pivot.
+        for token in argv[1:]:
+            candidate = Path(token).expanduser()
+            if candidate.is_absolute() and candidate.exists():
+                add(candidate if candidate.is_dir() else candidate.parent)
+    add(sys.prefix)
+    add(Path.home() / ".local" / "bin")
+    add(Path.home() / ".local" / "share" / "uv" / "tools")
+    return tuple(paths)
 
 
 # ---------------------------------------------------------------------------
@@ -1235,7 +1327,48 @@ class ACPNodeRunner:
             "env": [],
         }
 
-        # 2) Prompt rendering and 3) ACP spawn both happen inside the try so a
+        # 2) Resolve the sandbox before spawning. `auto` fails closed when no
+        #    backend is usable; an explicit `none` leaves the process on the
+        #    host (documented residual).
+        sandbox: Sandbox | None = None
+        sandbox_dir: Path | None = None
+        sandbox_home: Path | None = None
+        extra_ro_paths: tuple[str, ...] = ()
+        try:
+            sandbox = get_sandbox()
+            if sandbox.name != "none":
+                sandbox_dir = (
+                    store.zenith_runtime_dir(project_id)
+                    / "sandbox"
+                    / f"{task.id}-{spawn_ts}"
+                )
+                sandbox_home = prepare_node_home(
+                    role_config.worker_provider.name, sandbox_dir / "home"
+                )
+                extra_ro_paths = _sandbox_extra_ro_paths(acp_command)
+                acp_env = sandbox_env_for_provider(
+                    role_config.worker_provider.name, sandbox_home, acp_env
+                )
+        except (SandboxUnavailable, OSError) as exc:
+            if mcp_process.returncode is None:
+                try:
+                    mcp_process.terminate()
+                except OSError:
+                    pass
+            await _close_subprocess(mcp_process, timeout=5)
+            for task_ in (mcp_stdout_task, mcp_stderr_task):
+                task_.cancel()
+            try:
+                port_file.unlink()
+            except FileNotFoundError:
+                pass
+            if sandbox_dir is not None:
+                shutil.rmtree(sandbox_dir, ignore_errors=True)
+            return self._synthesize_missing_handoff(
+                task, summary=f"Sandbox unavailable: {exc}"
+            )
+
+        # 3) Prompt rendering and ACP spawn both happen inside the try so a
         #    failure in either still terminates the MCP server (M-05).
         process: asyncio.subprocess.Process | None = None
         client: ACPClient | None = None
@@ -1256,7 +1389,13 @@ class ACPNodeRunner:
                 project_id=project_id,
             )
             process = await _spawn_acp_process(
-                acp_command, cwd=workspace_dir, env=acp_env
+                acp_command,
+                cwd=workspace_dir,
+                env=acp_env,
+                sandbox=sandbox,
+                workspace=Path(workspace_dir),
+                home=sandbox_home,
+                extra_ro_paths=extra_ro_paths,
             )
             progress_tracker = ACPProgressTracker(callback=progress_callback)
             client = ACPClient(
@@ -1267,6 +1406,9 @@ class ACPNodeRunner:
                 allow_terminal=role_config.allow_agent_terminal,
                 max_terminal_output_bytes=role_config.max_terminal_output_bytes,
                 request_timeout=role_config.request_timeout,
+                sandbox=sandbox,
+                sandbox_home=sandbox_home,
+                sandbox_extra_ro_paths=extra_ro_paths,
             )
             await client.start()
             stderr_task = asyncio.create_task(_drain_stream_chunks(process.stderr))
@@ -1345,6 +1487,8 @@ class ACPNodeRunner:
                 port_file.unlink()
             except FileNotFoundError:
                 pass
+            if sandbox_dir is not None:
+                shutil.rmtree(sandbox_dir, ignore_errors=True)
 
         # 5) Parse and return.
         if handoff_path.exists():
@@ -1448,6 +1592,42 @@ class ACPNodeRunner:
             "env": [],
         }
 
+        sandbox: Sandbox | None = None
+        sandbox_dir: Path | None = None
+        sandbox_home: Path | None = None
+        extra_ro_paths: tuple[str, ...] = ()
+        try:
+            sandbox = get_sandbox()
+            if sandbox.name != "none":
+                sandbox_dir = (
+                    store.zenith_runtime_dir(project_id)
+                    / "sandbox"
+                    / f"review-{spawn_ts}"
+                )
+                sandbox_home = prepare_node_home(
+                    role_config.worker_provider.name, sandbox_dir / "home"
+                )
+                extra_ro_paths = _sandbox_extra_ro_paths(acp_command)
+                acp_env = sandbox_env_for_provider(
+                    role_config.worker_provider.name, sandbox_home, acp_env
+                )
+        except (SandboxUnavailable, OSError) as exc:
+            if mcp_process.returncode is None:
+                try:
+                    mcp_process.terminate()
+                except OSError:
+                    pass
+            await _close_subprocess(mcp_process, timeout=5)
+            for task_ in (mcp_stdout_task, mcp_stderr_task):
+                task_.cancel()
+            try:
+                port_file.unlink()
+            except FileNotFoundError:
+                pass
+            if sandbox_dir is not None:
+                shutil.rmtree(sandbox_dir, ignore_errors=True)
+            raise RuntimeError(f"Sandbox unavailable: {exc}") from exc
+
         process: asyncio.subprocess.Process | None = None
         client: ACPClient | None = None
         tracker: ACPProgressTracker | None = None
@@ -1462,7 +1642,13 @@ class ACPNodeRunner:
             # exec (not shell): H-9. The reviewer launch string is operator
             # config and is never parsed by a shell.
             process = await _spawn_acp_process(
-                acp_command, cwd=workspace_dir, env=acp_env
+                acp_command,
+                cwd=workspace_dir,
+                env=acp_env,
+                sandbox=sandbox,
+                workspace=Path(workspace_dir),
+                home=sandbox_home,
+                extra_ro_paths=extra_ro_paths,
             )
             tracker = ACPProgressTracker(callback=progress_callback)
             client = ACPClient(
@@ -1473,6 +1659,9 @@ class ACPNodeRunner:
                 allow_terminal=role_config.allow_agent_terminal,
                 max_terminal_output_bytes=role_config.max_terminal_output_bytes,
                 request_timeout=role_config.request_timeout,
+                sandbox=sandbox,
+                sandbox_home=sandbox_home,
+                sandbox_extra_ro_paths=extra_ro_paths,
             )
             await client.start()
             # Drain the reviewer's stderr continuously; otherwise the OS pipe
@@ -1542,6 +1731,8 @@ class ACPNodeRunner:
                 pass
             if review_dir is not None:
                 shutil.rmtree(review_dir, ignore_errors=True)
+            if sandbox_dir is not None:
+                shutil.rmtree(sandbox_dir, ignore_errors=True)
 
         if report_path.exists():
             try:

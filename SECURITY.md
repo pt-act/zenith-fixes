@@ -81,6 +81,27 @@ with a credential-free environment and a timeout; any non-zero exit blocks
 closure. A prompt-injected reviewer that says `done=true` therefore cannot
 seal a mission whose machine checks fail.
 
+### OS-level sandbox (opt-in)
+
+An ACP agent can be confined with an unprivileged Linux sandbox. `auto`
+prefers `bwrap`, then the built-in `unshare` + `pivot_root` backend, and fails
+closed if neither is usable:
+
+```bash
+export ZENITH_SANDBOX=auto       # or bwrap / unshare / none
+```
+
+The sandbox binds the mission workspace read-write at its absolute path,
+system trees read-only, `/proc`/`/tmp`/`/dev` fresh, and a per-node home
+containing only the selected provider's config. The host home, `$ZENITH_HOME`,
+other projects, and unrelated credentials are absent. ACP `terminal/*`
+commands run inside the same namespace.
+
+Phase 1 keeps host networking because the per-node MCP server is on host
+loopback; `ZENITH_SANDBOX_NETWORK=none` is refused until a container/proxy
+backend exists. `ZENITH_SANDBOX=none` is an explicit opt-out with no boundary
+beyond the environment allowlist and workspace confinement.
+
 ### ACP launch is exec, never a shell
 
 The adapter command is configuration, but it is not code: it is split with
