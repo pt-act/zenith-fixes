@@ -1266,12 +1266,14 @@ def _sandbox_extra_ro_paths(command: str) -> tuple[str, ...]:
     add(sys.prefix)
     add(Path.home() / ".local" / "bin")
     add(Path.home() / ".local" / "share" / "uv" / "tools")
-    # This host installs Hermes as a shim into ~/.hermes/hermes-agent and a
-    # private Python runtime under ~/.hermes/tools.
-    add(Path.home() / ".hermes" / "hermes-agent")
-    add(Path.home() / ".hermes" / "tools")
-    # Hermes' Python dependencies are resolved from the uv cache on this host.
-    add(Path.home() / ".hermes" / "cache" / "uv")
+    is_hermes_adapter = bool(argv) and "hermes" in " ".join(argv[:1]).lower()
+    if is_hermes_adapter:
+        # This host installs Hermes as a shim into ~/.hermes/hermes-agent and
+        # a private Python runtime under ~/.hermes/tools; its Python deps are
+        # resolved from the uv cache. Only the Hermes adapter needs these.
+        add(Path.home() / ".hermes" / "hermes-agent")
+        add(Path.home() / ".hermes" / "tools")
+        add(Path.home() / ".hermes" / "cache" / "uv")
     return tuple(paths)
 
 
