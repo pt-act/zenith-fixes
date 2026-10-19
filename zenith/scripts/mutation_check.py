@@ -35,7 +35,7 @@ class Mutation:
 MUTATIONS = [
     Mutation(
         "C-2 workspace containment removed",
-        "zenith/src/zenith_harness/acp_runner.py",
+        "src/zenith_harness/acp_runner.py",
         """        if resolved != self._workspace_root and not resolved.is_relative_to(
             self._workspace_root
         ):
@@ -47,21 +47,21 @@ MUTATIONS = [
     ),
     Mutation(
         "C-3 terminal allowed by default",
-        "zenith/src/zenith_harness/acp_runner.py",
+        "src/zenith_harness/acp_runner.py",
         "        if not self._allow_terminal:",
         "        if False:",
         "tests/test_audit_regressions.py::test_terminal_disabled_by_default",
     ),
     Mutation(
         "C-4 permission allowed by default",
-        "zenith/src/zenith_harness/acp_runner.py",
+        "src/zenith_harness/acp_runner.py",
         '        else:  # "deny"\n            chosen = self._pick_option(options, allow=False)',
         '        else:  # "deny"\n            chosen = self._pick_option(options, allow=True)',
         "tests/test_audit_regressions.py::test_permission_denied_by_default",
     ),
     Mutation(
         "C-6 decide_attention made non-atomic again",
-        "zenith/src/zenith_harness/controller.py",
+        "src/zenith_harness/controller.py",
         """        plan = self._plan_decisions(project_id, decisions, item_by_id)
         self._commit_decision_plan(project_id, plan)""",
         """        for _d in decisions:
@@ -73,14 +73,14 @@ MUTATIONS = [
     ),
     Mutation(
         "H-1 abort no longer dominates",
-        "zenith/src/zenith_harness/controller.py",
+        "src/zenith_harness/controller.py",
         "        aborting = [d for d in decisions if d.action == \"abort\"]",
         "        aborting = []",
         "tests/test_audit_regressions.py::test_abort_dominates_other_decisions",
     ),
     Mutation(
         "C-8 corrupt handoff raises again",
-        "zenith/src/zenith_harness/storage.py",
+        "src/zenith_harness/storage.py",
         """        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             quarantine_corrupt(path, reason=f"unparseable handoff: {exc}")
             return _corrupt_handoff(inferred_node, task_type, f"corrupt handoff file ({exc})")""",
@@ -90,28 +90,28 @@ MUTATIONS = [
     ),
     Mutation(
         "H-2 gate accepts unassigned votes again",
-        "zenith/src/zenith_harness/coordinator.py",
+        "src/zenith_harness/coordinator.py",
         "                if item.item_id in expected:",
         "                if item.item_id in gate.targets:",
         "tests/test_audit_regressions.py::test_gate_ignores_verdicts_for_unassigned_targets",
     ),
     Mutation(
         "C-7 project_id not validated",
-        "zenith/src/zenith_harness/ids.py",
+        "src/zenith_harness/ids.py",
         "    if not SAFE_COMPONENT_RE.fullmatch(value):",
         "    if False:",
         "tests/test_audit_regressions.py::test_unsafe_project_ids_rejected",
     ),
     Mutation(
         "C-7 project ids collide again",
-        "zenith/src/zenith_harness/storage.py",
+        "src/zenith_harness/storage.py",
         '        return f"{ts}-{slugify(first_line, \'project\')}-{secrets.token_hex(3)}"',
         '        return f"{ts}-{slugify(first_line, \'project\')}"',
         "tests/test_audit_regressions.py::test_generate_project_id_is_collision_resistant",
     ),
     Mutation(
         "H-6 oversized line kills the reader again (guard + finally reverted)",
-        "zenith/src/zenith_harness/acp_runner.py",
+        "src/zenith_harness/acp_runner.py",
         """        except (BrokenPipeError, ConnectionResetError, OSError, ValueError) as exc:
             # `ValueError` is what StreamReader.readline() raises when a line
             # exceeds the stream limit (asyncio.LimitOverrunError is a
@@ -129,31 +129,55 @@ MUTATIONS = [
     ),
     Mutation(
         "M-5 fences not adaptive again",
-        "zenith/src/zenith_harness/storage.py",
+        "src/zenith_harness/storage.py",
         "    longest = max((len(run) for run in _FENCE_RUN_RE.findall(content)), default=0)\n    marker = \"`\" * max(3, longest + 1)",
         '    marker = "```"',
         "tests/test_audit_regressions.py::test_decision_record_cannot_be_escaped_by_report_text",
     ),
     Mutation(
         "M-3 output limit not clamped",
-        "zenith/src/zenith_harness/acp_runner.py",
+        "src/zenith_harness/acp_runner.py",
         "            output_limit = min(requested, self._max_terminal_output_bytes)",
         "            output_limit = requested",
         "tests/test_audit_regressions.py::test_terminal_output_limit_is_clamped",
     ),
     Mutation(
         "C-5 handoff node_id not cross-checked",
-        "zenith/src/zenith_harness/acp_runner.py",
+        "src/zenith_harness/acp_runner.py",
         "        if isinstance(reported, str) and reported != task.id:",
         "        if False:",
         "tests/test_audit_regressions.py::test_handoff_for_a_different_task_is_rejected",
     ),
     Mutation(
         "H-3 brief inlined into reviewer prompt again",
-        "zenith/src/zenith_harness/acp_runner.py",
+        "src/zenith_harness/acp_runner.py",
         '                "user_request": (\n                    "The original user request is stored verbatim at "',
         '                "user_request": (\n                    brief_text + "\\nThe original user request is stored verbatim at "',
         "tests/test_audit_regressions.py::test_reviewer_prompt_does_not_inline_the_brief",
+    ),
+    Mutation(
+        "H-9 ACP launch goes back through a shell",
+        "src/zenith_harness/acp_runner.py",
+        """    return await asyncio.create_subprocess_exec(
+        *_acp_argv(command),""",
+        """    return await asyncio.create_subprocess_shell(
+        command,""",
+        "tests/test_audit_gaps.py::test_acp_spawn_does_not_interpret_shell_metacharacters",
+    ),
+    Mutation(
+        "M-1 attention queue is uncapped again",
+        "src/zenith_harness/attention.py",
+        "    max_items: int = MAX_OPEN_ATTENTION_ITEMS,",
+        "    max_items: int = 10**9,",
+        "tests/test_audit_gaps.py::test_attention_queue_is_capped_and_keeps_failures",
+    ),
+    Mutation(
+        "H-5 workspace shims written unconditionally again",
+        "src/zenith_harness/storage.py",
+        """        if self.config.workspace_shims:
+            self._ensure_symlink_shims(ws, zenith)""",
+        """        self._ensure_symlink_shims(ws, zenith)""",
+        "tests/test_audit_gaps.py::test_workspace_shims_are_opt_in",
     ),
 ]
 
@@ -161,7 +185,15 @@ MUTATIONS = [
 def run() -> int:
     if WORK.exists():
         shutil.rmtree(WORK)
-    shutil.copytree(SRC_TREE, WORK)
+    # Copy only the source tree: a .venv or git dir inside the checkout would
+    # make each run slow and can shadow the PYTHONPATH we set below.
+    shutil.copytree(
+        SRC_TREE,
+        WORK,
+        ignore=shutil.ignore_patterns(
+            ".venv", ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"
+        ),
+    )
 
     results: list[tuple[str, str, str]] = []
     for mut in MUTATIONS:
@@ -173,13 +205,13 @@ def run() -> int:
         target.write_text(original.replace(mut.old, mut.new, 1))
         proc = subprocess.run(
             [PY, "-m", "pytest", mut.test, "-q", "--no-header", "-p", "no:cacheprovider"],
-            cwd=WORK / "zenith",
+            cwd=WORK,
             capture_output=True,
             text=True,
             env={
-                "PYTHONPATH": str(WORK / "zenith" / "src"),
+                "PYTHONPATH": str(WORK / "src"),
                 "PATH": "/usr/local/bin:/usr/bin:/bin",
-                "HOME": "/workspace/home",
+                "HOME": os.environ.get("HOME", str(Path.home())),
             },
             timeout=300,
         )
