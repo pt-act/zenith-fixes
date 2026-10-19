@@ -1,0 +1,210 @@
+"""Mutation-test the audit fixes.
+
+Run from the checkout:
+    python scripts/mutation_check.py
+
+For each finding: revert the fix in a scratch copy, run the test that is
+supposed to pin it, and require the test to FAIL. A test that still passes with
+the fix removed is vacuous and proves nothing.
+
+Usage: python mutate_check.py
+"""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SRC_TREE = Path(__file__).resolve().parents[1]
+WORK = Path(os.environ.get("MUTATION_WORK", "/tmp/zenith-mutation"))
+PY = sys.executable
+
+
+class Mutation:
+    def __init__(self, name: str, path: str, old: str, new: str, test: str):
+        self.name = name
+        self.path = path
+        self.old = old
+        self.new = new
+        self.test = test
+
+
+MUTATIONS = [
+    Mutation(
+        "C-2 workspace containment removed",
+        "zenith/src/zenith_harness/acp_runner.py",
+        """        if resolved != self._workspace_root and not resolved.is_relative_to(
+            self._workspace_root
+        ):
+            raise ACPError(
+                f"path {raw!r} resolves outside the workspace and is refused"
+            )""",
+        "        pass",
+        "tests/test_audit_regressions.py::test_fs_read_refuses_parent_traversal",
+    ),
+    Mutation(
+        "C-3 terminal allowed by default",
+        "zenith/src/zenith_harness/acp_runner.py",
+        "        if not self._allow_terminal:",
+        "        if False:",
+        "tests/test_audit_regressions.py::test_terminal_disabled_by_default",
+    ),
+    Mutation(
+        "C-4 permission allowed by default",
+        "zenith/src/zenith_harness/acp_runner.py",
+        '        else:  # "deny"\n            chosen = self._pick_option(options, allow=False)',
+        '        else:  # "deny"\n            chosen = self._pick_option(options, allow=True)',
+        "tests/test_audit_regressions.py::test_permission_denied_by_default",
+    ),
+    Mutation(
+        "C-6 decide_attention made non-atomic again",
+        "zenith/src/zenith_harness/controller.py",
+        """        plan = self._plan_decisions(project_id, decisions, item_by_id)
+        self._commit_decision_plan(project_id, plan)""",
+        """        for _d in decisions:
+            _item = item_by_id.get(_d.item_id)
+            if _d.action == "patch" and _d.patch is not None and _item is not None:
+                self._apply_task_list_patch(project_id, _item.mission_id, _d.patch)
+        plan = _DecisionPlan(staged={}, status_changes={}, decision_number=self.store.next_decision_number(project_id))""",
+        "tests/test_audit_regressions.py::test_decide_attention_is_atomic_on_invalid_patch",
+    ),
+    Mutation(
+        "H-1 abort no longer dominates",
+        "zenith/src/zenith_harness/controller.py",
+        "        aborting = [d for d in decisions if d.action == \"abort\"]",
+        "        aborting = []",
+        "tests/test_audit_regressions.py::test_abort_dominates_other_decisions",
+    ),
+    Mutation(
+        "C-8 corrupt handoff raises again",
+        "zenith/src/zenith_harness/storage.py",
+        """        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            quarantine_corrupt(path, reason=f"unparseable handoff: {exc}")
+            return _corrupt_handoff(inferred_node, task_type, f"corrupt handoff file ({exc})")""",
+        """        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise""",
+        "tests/test_audit_regressions.py::test_corrupt_attempt_raises_attention_not_exception",
+    ),
+    Mutation(
+        "H-2 gate accepts unassigned votes again",
+        "zenith/src/zenith_harness/coordinator.py",
+        "                if item.item_id in expected:",
+        "                if item.item_id in gate.targets:",
+        "tests/test_audit_regressions.py::test_gate_ignores_verdicts_for_unassigned_targets",
+    ),
+    Mutation(
+        "C-7 project_id not validated",
+        "zenith/src/zenith_harness/ids.py",
+        "    if not SAFE_COMPONENT_RE.fullmatch(value):",
+        "    if False:",
+        "tests/test_audit_regressions.py::test_unsafe_project_ids_rejected",
+    ),
+    Mutation(
+        "C-7 project ids collide again",
+        "zenith/src/zenith_harness/storage.py",
+        '        return f"{ts}-{slugify(first_line, \'project\')}-{secrets.token_hex(3)}"',
+        '        return f"{ts}-{slugify(first_line, \'project\')}"',
+        "tests/test_audit_regressions.py::test_generate_project_id_is_collision_resistant",
+    ),
+    Mutation(
+        "H-6 oversized line kills the reader again (guard + finally reverted)",
+        "zenith/src/zenith_harness/acp_runner.py",
+        """        except (BrokenPipeError, ConnectionResetError, OSError, ValueError) as exc:
+            # `ValueError` is what StreamReader.readline() raises when a line
+            # exceeds the stream limit (asyncio.LimitOverrunError is a
+            # subclass). It used to escape this loop, kill the reader task, and
+            # leave every pending request — and therefore the whole node —
+            # waiting forever.
+            logger.warning("ACP read loop terminating: %s", exc)
+        finally:
+            self._closing = True""",
+        """        except (BrokenPipeError, ConnectionResetError, OSError, ValueError) as exc:
+            raise
+        finally:
+            pass""",
+        "tests/test_audit_regressions.py::test_oversized_line_fails_pending_request_instead_of_hanging",
+    ),
+    Mutation(
+        "M-5 fences not adaptive again",
+        "zenith/src/zenith_harness/storage.py",
+        "    longest = max((len(run) for run in _FENCE_RUN_RE.findall(content)), default=0)\n    marker = \"`\" * max(3, longest + 1)",
+        '    marker = "```"',
+        "tests/test_audit_regressions.py::test_decision_record_cannot_be_escaped_by_report_text",
+    ),
+    Mutation(
+        "M-3 output limit not clamped",
+        "zenith/src/zenith_harness/acp_runner.py",
+        "            output_limit = min(requested, self._max_terminal_output_bytes)",
+        "            output_limit = requested",
+        "tests/test_audit_regressions.py::test_terminal_output_limit_is_clamped",
+    ),
+    Mutation(
+        "C-5 handoff node_id not cross-checked",
+        "zenith/src/zenith_harness/acp_runner.py",
+        "        if isinstance(reported, str) and reported != task.id:",
+        "        if False:",
+        "tests/test_audit_regressions.py::test_handoff_for_a_different_task_is_rejected",
+    ),
+    Mutation(
+        "H-3 brief inlined into reviewer prompt again",
+        "zenith/src/zenith_harness/acp_runner.py",
+        '                "user_request": (\n                    "The original user request is stored verbatim at "',
+        '                "user_request": (\n                    brief_text + "\\nThe original user request is stored verbatim at "',
+        "tests/test_audit_regressions.py::test_reviewer_prompt_does_not_inline_the_brief",
+    ),
+]
+
+
+def run() -> int:
+    if WORK.exists():
+        shutil.rmtree(WORK)
+    shutil.copytree(SRC_TREE, WORK)
+
+    results: list[tuple[str, str, str]] = []
+    for mut in MUTATIONS:
+        target = WORK / mut.path
+        original = target.read_text()
+        if mut.old not in original:
+            results.append((mut.name, "SKIP", "anchor text not found"))
+            continue
+        target.write_text(original.replace(mut.old, mut.new, 1))
+        proc = subprocess.run(
+            [PY, "-m", "pytest", mut.test, "-q", "--no-header", "-p", "no:cacheprovider"],
+            cwd=WORK / "zenith",
+            capture_output=True,
+            text=True,
+            env={
+                "PYTHONPATH": str(WORK / "zenith" / "src"),
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "HOME": "/workspace/home",
+            },
+            timeout=300,
+        )
+        target.write_text(original)  # restore for the next mutation
+
+        out = proc.stdout + proc.stderr
+        if proc.returncode != 0:
+            verdict = "GOOD (test caught it)"
+        else:
+            verdict = "VACUOUS (test still passed!)"
+        # Show which test was affected.
+        m = re.search(r"(\d+ (?:failed|passed|error))", out)
+        results.append((mut.name, verdict, m.group(1) if m else "no summary"))
+
+    print(f"{'mutation':52s} {'verdict':26s} summary")
+    print("-" * 100)
+    bad = 0
+    for name, verdict, summary in results:
+        print(f"{name:52s} {verdict:26s} {summary}")
+        if verdict.startswith("VACUOUS") or verdict == "SKIP":
+            bad += 1
+    print()
+    print(f"{len(results) - bad}/{len(results)} mutations were caught by their test")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

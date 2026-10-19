@@ -985,3 +985,71 @@ def test_cli_renders_state_with_a_human_label() -> None:
     assert label.startswith("mission_running")
     assert "running" in label
     assert _state_label(None).startswith("draft")
+
+
+# ---------------------------------------------------------------------------
+# C-5 / C-9 — a handoff is only trusted for the task it was dispatched for
+# ---------------------------------------------------------------------------
+
+
+def test_handoff_for_a_different_task_is_rejected(store: ProjectStore, tmp_path: Path) -> None:
+    """A handoff naming another task must not be accepted as this task's result.
+
+    The worker MCP server is authenticated per node, but a stale file, a
+    misplaced write, or a second node's output landing at this path must not be
+    attributed to the wrong task. This is the independent check behind the
+    per-node token.
+    """
+    from zenith_harness.acp_runner import ACPNodeRunner
+    from zenith_harness.assets import AssetLoader
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    path = tmp_path / "handoff.json"
+    path.write_text(
+        json.dumps({"node_id": "SOMEONE-ELSE", "done": True, "report": "forged"})
+    )
+
+    runner = ACPNodeRunner(config=store.config, loader=AssetLoader(store.config))
+    task = Task(id="W1", type="work", body="b", targets=["A1"], skill="s")
+    handoff = runner._parse_handoff_file(path, task)
+
+    assert handoff.done is False, "a handoff for another task must not be accepted"
+    assert "does not match dispatched task" in handoff.report
+    # The mismatched artifact is quarantined, not left to be re-read.
+    assert not path.exists()
+    assert list(tmp_path.glob("*.corrupt"))
+
+
+def test_matching_handoff_is_accepted(store: ProjectStore, tmp_path: Path) -> None:
+    """The cross-check must not reject a legitimate handoff."""
+    from zenith_harness.acp_runner import ACPNodeRunner
+    from zenith_harness.assets import AssetLoader
+
+    path = tmp_path / "handoff.json"
+    path.write_text(
+        json.dumps({"node_id": "W1", "done": True, "report": "genuine"})
+    )
+    runner = ACPNodeRunner(config=store.config, loader=AssetLoader(store.config))
+    task = Task(id="W1", type="work", body="b", targets=["A1"], skill="s")
+    handoff = runner._parse_handoff_file(path, task)
+
+    assert handoff.done is True
+    assert handoff.report == "genuine"
+    assert path.exists(), "a valid handoff must not be quarantined"
+
+
+def test_corrupt_handoff_file_does_not_raise(store: ProjectStore, tmp_path: Path) -> None:
+    """A truncated handoff must degrade to a failed handoff, not an exception."""
+    from zenith_harness.acp_runner import ACPNodeRunner
+    from zenith_harness.assets import AssetLoader
+
+    path = tmp_path / "handoff.json"
+    path.write_text('{"node_id": "W1", "done": tru')
+    runner = ACPNodeRunner(config=store.config, loader=AssetLoader(store.config))
+    task = Task(id="W1", type="work", body="b", targets=["A1"], skill="s")
+
+    handoff = runner._parse_handoff_file(path, task)  # must not raise
+    assert handoff.done is False
+    assert "corrupt" in handoff.report
+    assert list(tmp_path.glob("*.corrupt"))
