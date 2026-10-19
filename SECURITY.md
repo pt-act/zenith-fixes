@@ -4,11 +4,11 @@
 
 `pt-act/zenith-fixes` is a maintained fork of
 [`Intelligent-Internet/zenith`](https://github.com/Intelligent-Internet/zenith).
-Upstream's last commit is `a8d9b57` (2026-09-06). This fork adds 21 commits on
-top of it: seventeen remediation commits from two audits, plus four follow-ups —
-portable acceptance commands and a documented `closure.json` path, a pinned
-linter, the security policy in this file, and a test that no longer depends on
-the host's `PATH`. It is released as **`v0.1.0-hardened`**.
+Upstream's last commit is `a8d9b57` (2026-09-06). On top of it this fork adds the
+seventeen remediation commits from two audits, plus follow-ups for portable
+acceptance commands and a documented `closure.json` path, a pinned linter, this
+security policy, and a test that no longer depends on the host's `PATH`. It is
+released as **`v0.1.0-hardened`**.
 
 The fork exists because upstream was audited before being used as the base for
 another project, and six boundaries that the harness's own threat model depends
