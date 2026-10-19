@@ -344,7 +344,7 @@ An optimization mission may close only when an explicit user/runtime budget or s
 
 `end_mission` requests the runtime closure path and terminal review. It is not a replacement for planning, validation, gates, evidence review, or attention handling.
 
-Runtime closure is fail-closed. The terminal reviewer's `done=true` is a veto gate, not the authority: runtime also requires every task/gate/contract assertion to be complete and requires `closure.json` with at least one acceptance command. Missing or empty `closure.json` blocks closure; commands must exit 0. A reviewer `done=true` cannot override a failed machine check. Required `closure.json` shape:
+Runtime closure is fail-closed. The terminal reviewer's `done=true` is a veto gate, not the authority: runtime also requires every task/gate/contract assertion to be complete and requires `closure.json` with at least one acceptance command. Write it to `<projectRoot>/missions/<missionId>/closure.json`, taking `projectRoot` and `missionId` from the runtime envelope. Missing or empty `closure.json` blocks closure; commands must exit 0. A reviewer `done=true` cannot override a failed machine check. Required `closure.json` shape:
 
 ```json
 {"commands": [{"argv": ["uv", "run", "--frozen", "pytest", "-q"], "timeout": 600}],

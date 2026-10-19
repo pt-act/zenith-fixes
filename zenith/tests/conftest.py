@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,13 +10,20 @@ import pytest
 
 @pytest.fixture
 def write_acceptance():
-    """Write a minimal passing closure.json for a mission."""
+    """Write a minimal passing closure.json for a mission.
+
+    The acceptance command must be portable. `/bin/true` does not exist on
+    macOS, so the suite failed there for a reason unrelated to the code under
+    test; the running interpreter is always present.
+    """
 
     def _write(store, project_id: str, mission_id: str = "mission-001") -> None:
         path = store.mission_dir(project_id, mission_id) / "closure.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"commands": [{"argv": ["/bin/true"]}]}),
+            json.dumps(
+                {"commands": [{"argv": [sys.executable, "-c", "pass"]}]}
+            ),
             encoding="utf-8",
         )
 

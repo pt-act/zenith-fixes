@@ -44,5 +44,5 @@ Results are written under `$ZENITH_EVAL_HOME` (default:
   boundary failures.
 - `results/2026-10-19-cross-model-matrix.json` — DeepSeek-V4.1-Flash-1017,
   DeepSeek-V4.1-Flash, and GLM-5.3-Flash, 2 cases each: same result.
-- Codex and Claude live attempts were blocked by adapter/auth state; they are
-  recorded as errors in `ARCHITECTURE_REMAINING.md`, not counted as passes.
+- Codex and Claude live attempts were blocked by adapter/auth state. They are
+  recorded as `errors` in the per-profile output and are not counted as passes.

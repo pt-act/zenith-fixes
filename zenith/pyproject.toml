@@ -64,7 +64,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "mypy>=1.0",
-    "ruff>=0.4",
+    # Same reasoning as the runtime pins above: `ruff` changed its default rule
+    # set between minors, so an unpinned floor turns a lockfile refresh into a
+    # CI failure. CI installs with `uv sync --frozen`, so the committed lock
+    # wins; this range keeps that lock inside a reviewed major.
+    "ruff~=0.15",
     "pytest-mock>=3.15.1",
     "types-pyyaml>=6.0.12.20250915",
 ]
