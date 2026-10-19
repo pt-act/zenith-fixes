@@ -14,6 +14,12 @@ from pathlib import Path
 from typing import Literal
 
 from . import attention as attn_factory
+from .closure import (
+    ClosureDecision,
+    evaluate_closure,
+    load_closure_spec,
+    run_acceptance,
+)
 from .dispatcher import (
     DispatchRequest,
     NodeDispatcher,
@@ -749,6 +755,30 @@ class MissionCoordinator:
     # Terminal review
     # ------------------------------------------------------------------
 
+    def _closure_decision(
+        self, mid: str, report: TerminalReviewHandoff
+    ) -> ClosureDecision:
+        """Machine checks + reviewer verdict, fail-closed."""
+        workspace = Path(self.store.workspace_dir(self.project_id))
+        spec = load_closure_spec(self.store, self.project_id, mid)
+        acceptance = None
+        if spec is not None and report.done:
+            acceptance = run_acceptance(spec, workspace)
+        read_paths = (
+            set(report.read_paths) if report.read_paths is not None else None
+        )
+        return evaluate_closure(
+            state=self.store.load_state(self.project_id),
+            task_list=self.store.load_task_list(self.project_id, mid),
+            task_state=self.store.load_task_state(self.project_id, mid),
+            contract_state=self.store.load_contract_state(self.project_id, mid),
+            review=report,
+            workspace=workspace,
+            read_paths=read_paths,
+            acceptance=acceptance,
+            open_attention=len(self.store.load_attention(self.project_id)),
+        )
+
     def _enter_terminal_review(self, mid: str) -> StepResult:
         spawn_ts = utc_now_filesafe()
         try:
@@ -795,18 +825,28 @@ class MissionCoordinator:
                     ),
                 )
 
-        self.store.save_terminal_review(self.project_id, mid, spawn_ts, report)
-        if report.done:
-            self.store.seal_mission(
-                self.project_id,
-                mid,
-                status="done",
-                body=report.report or "Mission complete; terminal review clean.",
+        # The reviewer is a veto, not the authority. Every machine check and
+        # the reviewer must agree before the mission can seal as done.
+        decision = self._closure_decision(mid, report)
+        if not decision.allowed:
+            blocked = TerminalReviewHandoff(
+                done=False,
+                report=(report.report + "\n\n" + decision.report()).strip(),
+                evidence=list(report.evidence),
             )
-            self.store.save_state(self.project_id, Done())
-            return StepResult.terminal("done")
-        self._raise_attention([attn_factory.terminal_review(mid, report)])
-        return StepResult.attention_needed("terminal_review")
+            self.store.save_terminal_review(self.project_id, mid, spawn_ts, blocked)
+            self._raise_attention([attn_factory.terminal_review(mid, blocked)])
+            return StepResult.attention_needed("terminal_review")
+
+        self.store.save_terminal_review(self.project_id, mid, spawn_ts, report)
+        self.store.seal_mission(
+            self.project_id,
+            mid,
+            status="done",
+            body=report.report or "Mission complete; terminal review clean.",
+        )
+        self.store.save_state(self.project_id, Done())
+        return StepResult.terminal("done")
 
     # ------------------------------------------------------------------
     # Attention queue

@@ -668,6 +668,10 @@ class ACPClient:
         self._request_tasks: set[asyncio.Task] = set()
         self._terminal_tasks: set[asyncio.Task] = set()
         self._closing = False
+        # Absolute paths served through ACP fs/read_text_file. The terminal
+        # reviewer's cited evidence must be a subset of this set; the reviewer
+        # cannot claim it inspected a file it never read through the harness.
+        self.read_paths: set[str] = set()
         # Safety/robustness policy. `deny` is the default: the client must not
         # silently authorize a destructive agent action on the operator's
         # behalf, and the previous unconditional `allow` made the ACP
@@ -927,6 +931,7 @@ class ACPClient:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return {"content": ""}
+        self.read_paths.add(str(path))
         line = params.get("line")
         limit = params.get("limit")
         if line is not None:
@@ -1540,13 +1545,18 @@ class ACPNodeRunner:
 
         if report_path.exists():
             try:
-                return TerminalReviewHandoff.model_validate_json(
+                review = TerminalReviewHandoff.model_validate_json(
                     report_path.read_text(encoding="utf-8")
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
                     f"Terminal reviewer wrote an unreadable verdict: {exc}"
                 ) from exc
+            if client is not None:
+                # Runtime provenance for the closure policy: every cited file
+                # must have been served through this client's fs channel.
+                review.set_read_paths(client.read_paths)
+            return review
         raise RuntimeError(
             "Terminal reviewer exited without calling submit_terminal_review; "
             "no terminal review was written. The mission cannot be sealed as done "

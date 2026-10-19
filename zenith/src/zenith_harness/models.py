@@ -17,7 +17,7 @@ import re
 import time
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 # Agent-authored prose is stored, mirrored, and returned to the orchestrator.
 # Unbounded reports let one worker exhaust disk/context; cap at 256 KiB with an
@@ -400,6 +400,19 @@ class TerminalReviewHandoff(BaseModel):
     done: bool
     report: str = ""
     evidence: list[str] = Field(default_factory=list)
+
+    # Runtime-only provenance: the absolute paths the reviewer actually read
+    # through the ACP fs channel. None means "not tracked" (legacy/mock
+    # reviewers); a list (including empty) is authoritative. PrivateAttr is
+    # not accepted from JSON, so a reviewer cannot forge its own read log.
+    _read_paths: list[str] | None = PrivateAttr(default=None)
+
+    @property
+    def read_paths(self) -> list[str] | None:
+        return self._read_paths
+
+    def set_read_paths(self, paths: "set[str] | list[str]") -> None:
+        self._read_paths = sorted(str(p) for p in paths)
 
     @field_validator("report", mode="before")
     @classmethod
